@@ -18,7 +18,7 @@ st.set_page_config(page_title="QR Login System", page_icon="🔐", layout="cente
 # =========================================================
 # CONSTANTS
 # =========================================================
-DB_PATH = "auth.db"
+DB_PATH = "auth1.db"
 SESSION_HOURS = 24
 QR_MINUTES = 5
 UNLINK_OTHERS_AFTER_DAYS = 7
