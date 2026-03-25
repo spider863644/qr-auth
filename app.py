@@ -7,16 +7,16 @@ from io import BytesIO
 from datetime import datetime
 import random
 
-# -------------------------
+# --------------------
 # DATABASE
-# -------------------------
+# --------------------
 
 conn = sqlite3.connect("auth.db", check_same_thread=False)
 c = conn.cursor()
 
 c.execute("""
 CREATE TABLE IF NOT EXISTS users(
-id INTEGER PRIMARY KEY AUTOINCREMENT,
+id INTEGER PRIMARY KEY,
 username TEXT,
 password TEXT
 )
@@ -24,7 +24,6 @@ password TEXT
 
 c.execute("""
 CREATE TABLE IF NOT EXISTS devices(
-id INTEGER PRIMARY KEY AUTOINCREMENT,
 username TEXT,
 device_hash TEXT
 )
@@ -40,268 +39,269 @@ status TEXT
 
 conn.commit()
 
-# -------------------------
+# --------------------
 # HELPERS
-# -------------------------
+# --------------------
 
-def hash_text(text):
-    return hashlib.sha256(text.encode()).hexdigest()
+def hash_text(t):
+    return hashlib.sha256(t.encode()).hexdigest()
 
-def get_device_hash():
-    device = st.session_state.get("device","unknown_device")
-    return hash_text(device)
+def device_hash():
+    return hash_text("demo_device")
 
-# -------------------------
+# --------------------
 # ML RISK DEMO
-# -------------------------
+# --------------------
 
-def predict_risk(device, ip, hour):
+def predict_risk(device,ip,hour):
 
-    score = random.uniform(0,1)
+    score=random.uniform(0,1)
 
-    if score < 0.4:
-        status = "Safe"
-    elif score < 0.7:
-        status = "Suspicious"
+    if score<0.4:
+        status="Safe"
+    elif score<0.7:
+        status="Suspicious"
     else:
-        status = "High Risk"
+        status="High Risk"
 
-    return round(score,2), status
+    return round(score,2),status
 
-# -------------------------
-# HANDLE QR APPROVAL
-# -------------------------
+# --------------------
+# QR APPROVAL (PHONE)
+# --------------------
 
-query_params = st.query_params
+query=st.query_params
 
-if "qr_token" in query_params:
+if "qr_token" in query:
 
-    token = query_params["qr_token"]
+    token=query["qr_token"]
 
-    c.execute("SELECT username,status FROM qr_tokens WHERE token=?", (token,))
-    result = c.fetchone()
+    if "user" not in st.session_state:
+        st.warning("Login first to approve QR request")
+        st.stop()
 
-    if result and result[1] == "pending":
+    c.execute("SELECT status FROM qr_tokens WHERE token=?", (token,))
+    row=c.fetchone()
 
-        st.title("Approve Login Request")
+    if row and row[0]=="pending":
 
-        st.write("User:", result[0])
+        st.title("Approve Login")
 
         if st.button("Approve Login"):
 
             c.execute(
-                "UPDATE qr_tokens SET status='approved' WHERE token=?",
-                (token,)
+            "UPDATE qr_tokens SET username=?,status='approved' WHERE token=?",
+            (st.session_state["user"],token)
             )
+
             conn.commit()
 
-            st.success("Login approved. You may close this page.")
-
+            st.success("Login approved")
             st.stop()
 
-# -------------------------
+# --------------------
 # REGISTER
-# -------------------------
+# --------------------
 
 def register():
 
     st.title("Register")
 
-    user = st.text_input("Username")
-    pw = st.text_input("Password", type="password")
+    u=st.text_input("Username")
+    p=st.text_input("Password",type="password")
 
     if st.button("Register"):
 
-        hashed = hash_text(pw)
+        c.execute(
+        "INSERT INTO users(username,password) VALUES(?,?)",
+        (u,hash_text(p))
+        )
 
-        c.execute("INSERT INTO users(username,password) VALUES(?,?)",(user,hashed))
         conn.commit()
 
         st.success("Account created")
 
-# -------------------------
+# --------------------
 # LOGIN
-# -------------------------
+# --------------------
 
 def login():
 
     st.title("Login")
 
-    user = st.text_input("Username")
-    pw = st.text_input("Password", type="password")
+    u=st.text_input("Username")
+    p=st.text_input("Password",type="password")
 
     if st.button("Login"):
 
-        hashed = hash_text(pw)
+        c.execute(
+        "SELECT * FROM users WHERE username=? AND password=?",
+        (u,hash_text(p))
+        )
 
-        c.execute("SELECT * FROM users WHERE username=? AND password=?",(user,hashed))
-        result = c.fetchone()
+        if c.fetchone():
 
-        if result:
-
-            st.session_state["user"] = user
+            st.session_state["user"]=u
             st.success("Logged in")
+            st.rerun()
 
         else:
-            st.error("Invalid credentials")
+            st.error("Invalid login")
 
-# -------------------------
+# --------------------
 # LOGOUT
-# -------------------------
+# --------------------
 
 def logout():
 
     if st.sidebar.button("Logout"):
 
         st.session_state.clear()
-        st.success("Logged out")
         st.rerun()
 
-# -------------------------
+# --------------------
 # LINK DEVICE
-# -------------------------
+# --------------------
 
 def link_device():
 
-    st.header("Link This Device")
+    st.header("Link Device")
 
-    device_hash = get_device_hash()
+    if st.button("Link this device"):
 
-    if st.button("Link Device"):
-
-        c.execute("INSERT INTO devices(username,device_hash) VALUES(?,?)",
-        (st.session_state["user"],device_hash))
+        c.execute(
+        "INSERT INTO devices VALUES(?,?)",
+        (st.session_state["user"],device_hash())
+        )
 
         conn.commit()
 
         st.success("Device linked")
 
-# -------------------------
+# --------------------
 # UNLINK DEVICE
-# -------------------------
+# --------------------
 
 def unlink_device():
 
     st.header("Unlink Device")
 
-    device_hash = get_device_hash()
-
-    if st.button("Unlink This Device"):
+    if st.button("Unlink this device"):
 
         c.execute(
         "DELETE FROM devices WHERE username=? AND device_hash=?",
-        (st.session_state["user"],device_hash)
+        (st.session_state["user"],device_hash())
         )
 
         conn.commit()
 
         st.success("Device removed")
 
-# -------------------------
-# QR LOGIN
-# -------------------------
+# --------------------
+# QR LOGIN (LAPTOP)
+# --------------------
 
 def qr_login():
 
-    st.header("QR Login")
+    st.title("QR Login")
 
-    token = str(uuid.uuid4())
+    token=str(uuid.uuid4())
 
     c.execute(
-        "INSERT INTO qr_tokens(token,username,status) VALUES(?,?,?)",
-        (token, st.session_state["user"], "pending")
+    "INSERT INTO qr_tokens(token,username,status) VALUES(?,?,?)",
+    (token,"","pending")
     )
+
     conn.commit()
 
-    base_url = st.secrets.get("APP_URL","http://localhost:8501")
+    base_url=st.secrets.get("APP_URL","http://localhost:8501")
 
-    url = f"{base_url}/?qr_token={token}"
+    url=f"{base_url}/?qr_token={token}"
 
-    qr = qrcode.make(url)
+    qr=qrcode.make(url)
 
-    buf = BytesIO()
+    buf=BytesIO()
     qr.save(buf)
 
     st.image(buf.getvalue())
 
-    st.write("Scan QR with trusted device")
+    st.write("Scan with your logged-in device")
 
-    if st.button("Check Login Status"):
+    if st.button("Check Status"):
 
-        c.execute("SELECT status FROM qr_tokens WHERE token=?", (token,))
-        status = c.fetchone()[0]
+        c.execute(
+        "SELECT username,status FROM qr_tokens WHERE token=?",
+        (token,)
+        )
 
-        if status == "approved":
-            st.success("Login successful!")
+        row=c.fetchone()
+
+        if row and row[1]=="approved":
+
+            st.session_state["user"]=row[0]
+            st.success("Logged in successfully")
+            st.rerun()
+
         else:
-            st.warning("Waiting for approval...")
+            st.warning("Waiting for approval")
 
-# -------------------------
+# --------------------
 # DASHBOARD
-# -------------------------
+# --------------------
 
 def dashboard():
 
-    st.title("ML Authentication Dashboard")
+    st.title("ML Security Dashboard")
 
-    st.write("User:", st.session_state["user"])
+    device=device_hash()
+    ip="127.0.0.1"
 
-    device = get_device_hash()
-    ip = "127.0.0.1"
-
-    score,status = predict_risk(device,ip,datetime.now().hour)
+    score,status=predict_risk(device,ip,datetime.now().hour)
 
     st.metric("Risk Score",score)
     st.metric("Status",status)
 
-    st.subheader("Linked Devices")
+    st.subheader("Trusted Devices")
 
-    c.execute("SELECT device_hash FROM devices WHERE username=?",
-    (st.session_state["user"],))
+    c.execute(
+    "SELECT device_hash FROM devices WHERE username=?",
+    (st.session_state["user"],)
+    )
 
-    devices = c.fetchall()
-
-    for d in devices:
+    for d in c.fetchall():
         st.code(d[0][:20])
 
-# -------------------------
+# --------------------
 # MENU
-# -------------------------
+# --------------------
 
-menu = st.sidebar.selectbox("Menu",[
-"Login",
-"Register"
-])
+if "user" not in st.session_state:
 
-if menu == "Login":
-    login()
+    menu=st.sidebar.selectbox("Menu",["Login","Register","QR Login"])
 
-if menu == "Register":
-    register()
+    if menu=="Login":
+        login()
 
-# -------------------------
-# USER PANEL
-# -------------------------
+    if menu=="Register":
+        register()
 
-if "user" in st.session_state:
+    if menu=="QR Login":
+        qr_login()
+
+else:
 
     logout()
 
-    page = st.sidebar.selectbox("Dashboard",[
+    page=st.sidebar.selectbox(
     "Dashboard",
-    "Link Device",
-    "Unlink Device",
-    "QR Login"
-    ])
+    ["Dashboard","Link Device","Unlink Device"]
+    )
 
-    if page == "Dashboard":
+    if page=="Dashboard":
         dashboard()
 
-    if page == "Link Device":
+    if page=="Link Device":
         link_device()
 
-    if page == "Unlink Device":
+    if page=="Unlink Device":
         unlink_device()
-
-    if page == "QR Login":
-        qr_login()
