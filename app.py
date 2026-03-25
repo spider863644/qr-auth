@@ -7,6 +7,7 @@ from io import BytesIO
 from datetime import datetime, timedelta
 import random
 import time
+import requests
 import extra_streamlit_components as stx
 
 # =========================================================
@@ -20,6 +21,7 @@ st.set_page_config(page_title="QR Login System", page_icon="🔐", layout="cente
 DB_PATH = "auth.db"
 SESSION_HOURS = 24
 QR_MINUTES = 5
+UNLINK_OTHERS_AFTER_DAYS = 7
 
 # =========================================================
 # COOKIE MANAGER
@@ -55,6 +57,7 @@ def safe_delete_cookie(cookie_name: str):
 # DATABASE
 # =========================================================
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+conn.row_factory = sqlite3.Row
 c = conn.cursor()
 
 c.execute("""
@@ -77,6 +80,7 @@ c.execute("""
 CREATE TABLE IF NOT EXISTS qr_tokens(
     token TEXT PRIMARY KEY,
     username TEXT,
+    requested_username TEXT,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL
 )
@@ -95,6 +99,12 @@ conn.commit()
 # =========================================================
 # MIGRATIONS
 # =========================================================
+def column_exists(table_name, column_name):
+    c.execute(f"PRAGMA table_info({table_name})")
+    cols = [row[1] for row in c.fetchall()]
+    return column_name in cols
+
+
 def ensure_devices_unique_constraint():
     c.execute("PRAGMA index_list(devices)")
     indexes = c.fetchall()
@@ -127,6 +137,27 @@ def ensure_devices_unique_constraint():
 
 ensure_devices_unique_constraint()
 
+device_columns_to_add = {
+    "device_name": "TEXT",
+    "location": "TEXT",
+    "linked_at": "TEXT"
+}
+
+for col_name, col_type in device_columns_to_add.items():
+    if not column_exists("devices", col_name):
+        c.execute(f"ALTER TABLE devices ADD COLUMN {col_name} {col_type}")
+        conn.commit()
+
+if not column_exists("qr_tokens", "requested_username"):
+    c.execute("ALTER TABLE qr_tokens ADD COLUMN requested_username TEXT")
+    conn.commit()
+
+# backfill old rows
+c.execute("UPDATE devices SET device_name='Unknown device' WHERE device_name IS NULL OR device_name=''")
+c.execute("UPDATE devices SET location='Unknown location' WHERE location IS NULL OR location=''")
+c.execute("UPDATE devices SET linked_at=? WHERE linked_at IS NULL OR linked_at=''", (datetime.now().isoformat(),))
+conn.commit()
+
 # =========================================================
 # HELPERS
 # =========================================================
@@ -140,6 +171,23 @@ def parse_iso(value: str) -> datetime:
 
 def hash_text(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
+
+
+def get_headers():
+    return getattr(st.context, "headers", {})
+
+
+def get_client_ip() -> str:
+    headers = get_headers()
+    forwarded = headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    return headers.get("x-real-ip", "") or "127.0.0.1"
+
+
+def get_user_agent() -> str:
+    headers = get_headers()
+    return headers.get("user-agent", "unknown")
 
 
 def get_or_create_device_id():
@@ -162,6 +210,58 @@ def device_hash() -> str:
     return hash_text(get_or_create_device_id())
 
 
+def get_device_name() -> str:
+    ua = get_user_agent().lower()
+
+    browser = "Unknown Browser"
+    os_name = "Unknown OS"
+
+    if "samsungbrowser" in ua:
+        browser = "Samsung Internet"
+    elif "edg" in ua:
+        browser = "Edge"
+    elif "chrome" in ua and "edg" not in ua:
+        browser = "Chrome"
+    elif "firefox" in ua:
+        browser = "Firefox"
+    elif "safari" in ua and "chrome" not in ua:
+        browser = "Safari"
+    elif "opr" in ua or "opera" in ua:
+        browser = "Opera"
+
+    if "windows" in ua:
+        os_name = "Windows"
+    elif "android" in ua:
+        os_name = "Android"
+    elif "iphone" in ua or "ipad" in ua or "ios" in ua:
+        os_name = "iOS"
+    elif "mac os x" in ua or "macintosh" in ua:
+        os_name = "macOS"
+    elif "linux" in ua:
+        os_name = "Linux"
+
+    return f"{browser} on {os_name}"
+
+
+def get_location_from_ip(ip: str) -> str:
+    if not ip or ip in ("127.0.0.1", "::1", "localhost"):
+        return "Local / Unknown location"
+
+    try:
+        resp = requests.get(f"https://ipwho.is/{ip}", timeout=3)
+        data = resp.json()
+        if data.get("success"):
+            city = data.get("city") or ""
+            region = data.get("region") or ""
+            country = data.get("country") or ""
+            parts = [p for p in [city, region, country] if p]
+            if parts:
+                return ", ".join(parts)
+        return "Unknown location"
+    except Exception:
+        return "Unknown location"
+
+
 def predict_risk(device: str, ip: str, hour: int):
     score = random.uniform(0, 1)
     if score < 0.4:
@@ -173,6 +273,75 @@ def predict_risk(device: str, ip: str, hour: int):
     return round(score, 2), status
 
 
+def is_device_linked(username: str, device_hash_value: str) -> bool:
+    c.execute(
+        "SELECT 1 FROM devices WHERE username=? AND device_hash=?",
+        (username, device_hash_value)
+    )
+    return c.fetchone() is not None
+
+
+def get_user_device_count(username: str) -> int:
+    c.execute("SELECT COUNT(*) FROM devices WHERE username=?", (username,))
+    return c.fetchone()[0]
+
+
+def get_device_row(username: str, device_hash_value: str):
+    c.execute(
+        """
+        SELECT * FROM devices
+        WHERE username=? AND device_hash=?
+        """,
+        (username, device_hash_value)
+    )
+    return c.fetchone()
+
+
+def current_device_can_unlink_others(username: str, current_hash: str):
+    row = get_device_row(username, current_hash)
+    if not row:
+        return False, "Current device is not linked."
+
+    linked_at = row["linked_at"]
+    if not linked_at:
+        return False, "Current device has no linked date."
+
+    age = datetime.now() - parse_iso(linked_at)
+    if age >= timedelta(days=UNLINK_OTHERS_AFTER_DAYS):
+        return True, ""
+
+    remaining = timedelta(days=UNLINK_OTHERS_AFTER_DAYS) - age
+    remaining_days = max(1, remaining.days + (1 if remaining.seconds > 0 else 0))
+    return False, f"You can unlink other devices after {remaining_days} more day(s) of using this linked device."
+
+
+def link_current_device(username: str):
+    current_hash = device_hash()
+    current_name = get_device_name()
+    current_location = get_location_from_ip(get_client_ip())
+
+    c.execute(
+        """
+        INSERT OR IGNORE INTO devices(username, device_hash, device_name, location, linked_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (username, current_hash, current_name, current_location, now_iso())
+    )
+    conn.commit()
+
+    c.execute(
+        """
+        UPDATE devices
+        SET device_name = COALESCE(NULLIF(device_name, ''), ?),
+            location = COALESCE(NULLIF(location, ''), ?),
+            linked_at = COALESCE(linked_at, ?)
+        WHERE username=? AND device_hash=?
+        """,
+        (current_name, current_location, now_iso(), username, current_hash)
+    )
+    conn.commit()
+
+
 # =========================================================
 # CLEANUP
 # =========================================================
@@ -180,7 +349,9 @@ def cleanup_old_entries():
     now = datetime.now()
 
     c.execute("SELECT session_id, created_at FROM sessions")
-    for session_id, created_at in c.fetchall():
+    for row in c.fetchall():
+        session_id = row["session_id"]
+        created_at = row["created_at"]
         try:
             if now - parse_iso(created_at) > timedelta(hours=SESSION_HOURS):
                 c.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
@@ -188,7 +359,9 @@ def cleanup_old_entries():
             c.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
 
     c.execute("SELECT token, created_at FROM qr_tokens")
-    for token, created_at in c.fetchall():
+    for row in c.fetchall():
+        token = row["token"]
+        created_at = row["created_at"]
         try:
             if now - parse_iso(created_at) > timedelta(minutes=QR_MINUTES):
                 c.execute("DELETE FROM qr_tokens WHERE token=?", (token,))
@@ -242,7 +415,8 @@ def get_session_user():
         safe_delete_cookie("user_session")
         return None
 
-    username, created_at = row
+    username = row["username"]
+    created_at = row["created_at"]
 
     try:
         created_dt = parse_iso(created_at)
@@ -287,20 +461,21 @@ def logout_user():
     st.rerun()
 
 
-# restore session on app load
 existing_user = get_session_user()
 if existing_user:
     st.session_state["user"] = existing_user
 
-
 # =========================================================
 # QR TOKEN HELPERS
 # =========================================================
-def create_qr_token():
+def create_qr_token(requested_username: str = ""):
     token = str(uuid.uuid4())
     c.execute(
-        "INSERT INTO qr_tokens(token, username, status, created_at) VALUES (?, ?, ?, ?)",
-        (token, "", "pending", now_iso())
+        """
+        INSERT INTO qr_tokens(token, username, requested_username, status, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (token, "", requested_username, "pending", now_iso())
     )
     conn.commit()
     return token
@@ -308,16 +483,24 @@ def create_qr_token():
 
 def get_qr_status(token: str):
     c.execute(
-        "SELECT username, status, created_at FROM qr_tokens WHERE token=?",
+        """
+        SELECT username, requested_username, status, created_at
+        FROM qr_tokens
+        WHERE token=?
+        """,
         (token,)
     )
     return c.fetchone()
 
 
-def approve_qr_token(token: str, username: str):
+def approve_qr_token(token: str, approving_username: str):
     c.execute(
-        "UPDATE qr_tokens SET username=?, status='approved' WHERE token=? AND status='pending'",
-        (username, token)
+        """
+        UPDATE qr_tokens
+        SET username=?, status='approved'
+        WHERE token=? AND status='pending'
+        """,
+        (approving_username, token)
     )
     conn.commit()
 
@@ -335,9 +518,19 @@ def qr_is_expired(created_at: str) -> bool:
 
 
 # =========================================================
+# LOGIN HELPERS
+# =========================================================
+def start_new_device_qr_flow(username: str):
+    token = create_qr_token(requested_username=username)
+    st.session_state["qr_token"] = token
+    st.session_state["pending_login_username"] = username
+    return token
+
+
+# =========================================================
 # SHARED LOGIN FORM
 # =========================================================
-def login_form(title="Login", button_key="login_button"):
+def login_form(title="Login", button_key="login_button", redirect_untrusted_to_qr=False):
     st.title(title)
 
     username = st.text_input("Username", key=f"{button_key}_username")
@@ -352,13 +545,30 @@ def login_form(title="Login", button_key="login_button"):
         )
         user = c.fetchone()
 
-        if user:
-            create_session(username)
-            st.success("Logged in successfully.")
-            time.sleep(0.5)
-            return True
-        else:
+        if not user:
             st.error("Invalid username or password.")
+            return False
+
+        current_hash = device_hash()
+
+        if redirect_untrusted_to_qr:
+            device_count = get_user_device_count(username)
+
+            # allow direct login if:
+            # - no trusted devices yet
+            # - or current device is already linked
+            if device_count == 0 or is_device_linked(username, current_hash):
+                pass
+            else:
+                start_new_device_qr_flow(username)
+                st.warning("This device is not trusted. Approval from a linked device is required.")
+                time.sleep(0.7)
+                st.rerun()
+
+        create_session(username)
+        st.success("Logged in successfully.")
+        time.sleep(0.5)
+        return True
 
     return False
 
@@ -385,7 +595,16 @@ def register():
                 (username, hash_text(password))
             )
             conn.commit()
-            st.success("Account created successfully.")
+
+            # trust registration device automatically
+            link_current_device(username)
+
+            create_session(username)
+
+            st.success("Account created successfully. This device is now your first trusted device.")
+            time.sleep(0.8)
+            st.rerun()
+
         except sqlite3.IntegrityError:
             st.error("Username already exists.")
 
@@ -394,13 +613,18 @@ def register():
 # NORMAL LOGIN PAGE
 # =========================================================
 def login():
-    success = login_form(title="Login", button_key="main_login_button")
+    success = login_form(
+        title="Login",
+        button_key="main_login_button",
+        redirect_untrusted_to_qr=True
+    )
     if success:
         st.rerun()
 
 
 # =========================================================
 # QR APPROVAL PAGE
+# STRICT MODE
 # =========================================================
 def qr_approval_page(token: str):
     st.title("Approve QR Login")
@@ -410,7 +634,10 @@ def qr_approval_page(token: str):
         st.error("This QR request does not exist or has expired.")
         st.stop()
 
-    requested_username, status, created_at = row
+    approved_username = row["username"]
+    requested_username = row["requested_username"]
+    status = row["status"]
+    created_at = row["created_at"]
 
     if qr_is_expired(created_at):
         delete_qr_token(token)
@@ -426,15 +653,34 @@ def qr_approval_page(token: str):
 
     if not approving_user:
         st.info("Log in on this page to approve the QR login.")
-        success = login_form(title="Login to Approve", button_key="qr_approval_login_button")
+        success = login_form(
+            title="Login to Approve",
+            button_key="qr_approval_login_button",
+            redirect_untrusted_to_qr=False
+        )
         if success:
             st.rerun()
         st.stop()
 
+    current_hash = device_hash()
+
+    # Strict rule 1: same user only
+    if requested_username and approving_user != requested_username:
+        st.error("Only the same user account can approve this login.")
+        st.info(f"This login request is for: {requested_username}")
+        st.stop()
+
+    # Strict rule 2: trusted linked device only
+    if not is_device_linked(approving_user, current_hash):
+        st.error("This device is not trusted and cannot approve QR login.")
+        st.info("Use one of your linked devices to approve this login.")
+        st.stop()
+
     st.success(f"Logged in as: {approving_user}")
+    st.info("This is a trusted device.")
 
     if status == "approved":
-        st.info(f"This login has already been approved for {requested_username}.")
+        st.info(f"This login has already been approved for {approved_username}.")
         st.stop()
 
     if st.button("Approve Login", key="approve_qr_button", use_container_width=True):
@@ -454,28 +700,15 @@ def link_device():
     current_hash = device_hash()
 
     if st.button("Link this device", key="link_device_button", use_container_width=True):
-        c.execute(
-            "SELECT id FROM devices WHERE username=? AND device_hash=?",
-            (current_user, current_hash)
-        )
-        exists = c.fetchone()
-
-        if exists:
+        if is_device_linked(current_user, current_hash):
             st.warning("This device is already linked to your account.")
         else:
-            try:
-                c.execute(
-                    "INSERT INTO devices(username, device_hash) VALUES (?, ?)",
-                    (current_user, current_hash)
-                )
-                conn.commit()
-                st.success("Device linked successfully.")
-            except sqlite3.IntegrityError:
-                st.warning("This device is already linked to your account.")
+            link_current_device(current_user)
+            st.success("Device linked successfully.")
 
 
-def unlink_device():
-    st.subheader("Unlink Device")
+def unlink_current_device():
+    st.subheader("Unlink Current Device")
     current_user = st.session_state["user"]
     current_hash = device_hash()
 
@@ -494,11 +727,68 @@ def unlink_device():
                 (current_user, current_hash)
             )
             conn.commit()
-            st.success("Device removed.")
+            st.success("Current device removed.")
+
+
+def unlink_other_devices():
+    st.subheader("Unlink Other Devices")
+
+    current_user = st.session_state["user"]
+    current_hash = device_hash()
+
+    allowed, reason = current_device_can_unlink_others(current_user, current_hash)
+
+    if not allowed:
+        st.warning(reason)
+
+    c.execute(
+        """
+        SELECT id, device_name, location, linked_at, device_hash
+        FROM devices
+        WHERE username=? AND device_hash!=?
+        ORDER BY linked_at DESC
+        """,
+        (current_user, current_hash)
+    )
+    rows = c.fetchall()
+
+    if not rows:
+        st.info("No other linked devices found.")
+        return
+
+    for row in rows:
+        device_id = row["id"]
+        device_name = row["device_name"] or "Unknown device"
+        location = row["location"] or "Unknown location"
+        linked_at = row["linked_at"] or "Unknown date"
+
+        try:
+            linked_display = parse_iso(linked_at).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            linked_display = linked_at
+
+        with st.container(border=True):
+            st.markdown(f"**{device_name}**")
+            st.write(f"Location: {location}")
+            st.write(f"Linked: {linked_display}")
+
+            if st.button(
+                f"Unlink Device #{device_id}",
+                key=f"unlink_other_{device_id}",
+                use_container_width=True,
+                disabled=not allowed
+            ):
+                c.execute(
+                    "DELETE FROM devices WHERE id=? AND username=?",
+                    (device_id, current_user)
+                )
+                conn.commit()
+                st.success(f"{device_name} removed.")
+                st.rerun()
 
 
 # =========================================================
-# QR LOGIN PAGE (PC / LAPTOP)
+# QR LOGIN PAGE
 # =========================================================
 def qr_login():
     st.title("QR Login")
@@ -510,11 +800,15 @@ def qr_login():
 
     row = get_qr_status(token)
     if not row:
-        st.session_state["qr_token"] = create_qr_token()
+        requested_username = st.session_state.get("pending_login_username", "")
+        st.session_state["qr_token"] = create_qr_token(requested_username=requested_username)
         token = st.session_state["qr_token"]
         row = get_qr_status(token)
 
-    username, status, created_at = row
+    approved_username = row["username"]
+    requested_username = row["requested_username"]
+    status = row["status"]
+    created_at = row["created_at"]
 
     if qr_is_expired(created_at):
         delete_qr_token(token)
@@ -531,7 +825,10 @@ def qr_login():
     buf = BytesIO()
     qr.save(buf)
 
-    st.image(buf.getvalue(), caption="Scan this with your phone", use_container_width=False)
+    st.image(buf.getvalue(), caption="Scan this with your trusted linked device", use_container_width=False)
+
+    if requested_username:
+        st.info(f"Pending login for: {requested_username}")
 
     created_dt = parse_iso(created_at)
     remaining = timedelta(minutes=QR_MINUTES) - (datetime.now() - created_dt)
@@ -541,23 +838,35 @@ def qr_login():
 
     st.caption(f"Expires in {minutes:02d}:{seconds:02d}")
 
-    if status == "approved" and username:
-        create_session(username)
+    if status == "approved" and approved_username:
+        if requested_username and approved_username != requested_username:
+            st.error("Approval account mismatch. Login blocked.")
+            delete_qr_token(token)
+            if "qr_token" in st.session_state:
+                del st.session_state["qr_token"]
+            st.stop()
+
+        create_session(approved_username)
         delete_qr_token(token)
+
         if "qr_token" in st.session_state:
             del st.session_state["qr_token"]
-        st.success(f"Logged in as {username}.")
+        if "pending_login_username" in st.session_state:
+            del st.session_state["pending_login_username"]
+
+        st.success(f"Logged in as {approved_username}.")
         time.sleep(0.8)
         st.rerun()
     else:
-        st.warning("Waiting for approval...")
+        st.warning("Waiting for approval from a trusted linked device...")
 
         col1, col2 = st.columns(2)
 
         with col1:
             if st.button("Generate New QR", key="new_qr_button", use_container_width=True):
                 delete_qr_token(token)
-                st.session_state["qr_token"] = create_qr_token()
+                requested_username = st.session_state.get("pending_login_username", "")
+                st.session_state["qr_token"] = create_qr_token(requested_username=requested_username)
                 st.rerun()
 
         with col2:
@@ -576,7 +885,7 @@ def dashboard():
     st.title("ML Security Dashboard")
     st.write(f"Welcome, **{current_user}**")
 
-    ip = "127.0.0.1"
+    ip = get_client_ip()
     device = device_hash()
 
     score, status = predict_risk(device, ip, datetime.now().hour)
@@ -585,16 +894,40 @@ def dashboard():
     col1.metric("Risk Score", score)
     col2.metric("Status", status)
 
-    st.subheader("Trusted Devices")
+    st.subheader("Linked Devices")
+
     c.execute(
-        "SELECT device_hash FROM devices WHERE username=?",
+        """
+        SELECT id, device_name, location, linked_at, device_hash
+        FROM devices
+        WHERE username=?
+        ORDER BY linked_at DESC
+        """,
         (current_user,)
     )
     rows = c.fetchall()
 
+    current_hash = device_hash()
+
     if rows:
         for row in rows:
-            st.code(row[0][:24])
+            device_name = row["device_name"] or "Unknown device"
+            location = row["location"] or "Unknown location"
+            linked_at = row["linked_at"] or "Unknown date"
+            is_current = row["device_hash"] == current_hash
+
+            try:
+                linked_display = parse_iso(linked_at).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                linked_display = linked_at
+
+            with st.container(border=True):
+                title = device_name
+                if is_current:
+                    title += "  •  Current device"
+                st.markdown(f"**{title}**")
+                st.write(f"Location: {location}")
+                st.write(f"Linked: {linked_display}")
     else:
         st.info("No linked devices yet.")
 
@@ -614,21 +947,24 @@ if "qr_token" in query:
 # MAIN APP
 # =========================================================
 if "user" not in st.session_state:
-    menu = st.sidebar.selectbox("Menu", ["Login", "Register", "QR Login"], key="main_menu")
-
-    if menu == "Login":
-        login()
-    elif menu == "Register":
-        register()
-    elif menu == "QR Login":
+    if "qr_token" in st.session_state and "pending_login_username" in st.session_state:
         qr_login()
+    else:
+        menu = st.sidebar.selectbox("Menu", ["Login", "Register", "QR Login"], key="main_menu")
+
+        if menu == "Login":
+            login()
+        elif menu == "Register":
+            register()
+        elif menu == "QR Login":
+            qr_login()
 else:
     if st.sidebar.button("Logout", key="logout_button", use_container_width=True):
         logout_user()
 
     page = st.sidebar.selectbox(
         "Dashboard",
-        ["Dashboard", "Link Device", "Unlink Device"],
+        ["Dashboard", "Link Device", "Unlink Current Device", "Unlink Other Devices"],
         key="dashboard_menu"
     )
 
@@ -636,5 +972,7 @@ else:
         dashboard()
     elif page == "Link Device":
         link_device()
-    elif page == "Unlink Device":
-        unlink_device()
+    elif page == "Unlink Current Device":
+        unlink_current_device()
+    elif page == "Unlink Other Devices":
+        unlink_other_devices()
