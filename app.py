@@ -118,10 +118,19 @@ query = st.query_params
 if "qr_token" in query:
     token = query["qr_token"][0]
     st.title("Approve QR Login")
+
+    # Check who is logged in on this device
+    approving_user = get_session()
+    if not approving_user:
+        st.warning("You must be logged in to approve this login.")
+        st.stop()
+
+    st.write(f"Logged in as: **{approving_user}**")
+
     if st.button("Approve Login"):
-        # Approve without username/password
-        c.execute("UPDATE qr_tokens SET status='approved', username='approved_user' WHERE token=?",
-                  (token,))
+        # Set the QR token's username to the approving user
+        c.execute("UPDATE qr_tokens SET status='approved', username=? WHERE token=?",
+                  (approving_user, token))
         conn.commit()
         st.success("Login approved. You may close this tab.")
     st.stop()
@@ -200,9 +209,9 @@ def qr_login():
     if st.button("Check Status"):
         c.execute("SELECT username, status FROM qr_tokens WHERE token=?", (token,))
         row = c.fetchone()
-        if row and row[1] == "approved":
-            create_session("approved_user")
-            st.success("Logged in successfully")
+        if row and row[1] == "approved" and row[0]:
+            create_session(row[0])  # Log in as the approving user
+            st.success(f"Logged in as {row[0]} successfully")
             st.experimental_rerun()
         else:
             st.warning("Waiting for approval")
