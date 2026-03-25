@@ -55,6 +55,25 @@ created_at TIMESTAMP
 conn.commit()
 
 # ------------------------
+# CLEANUP OLD ENTRIES
+# ------------------------
+def cleanup_old_entries():
+    now = datetime.now()
+    # cleanup sessions
+    c.execute("SELECT session_id, created_at FROM sessions")
+    for session_id, created_at in c.fetchall():
+        if now - datetime.fromisoformat(created_at) > timedelta(hours=24):
+            c.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
+    # cleanup QR tokens
+    c.execute("SELECT token, created_at FROM qr_tokens")
+    for token, created_at in c.fetchall():
+        if now - datetime.fromisoformat(created_at) > timedelta(hours=24):
+            c.execute("DELETE FROM qr_tokens WHERE token=?", (token,))
+    conn.commit()
+
+cleanup_old_entries()
+
+# ------------------------
 # HELPERS
 # ------------------------
 def hash_text(t):
@@ -127,7 +146,6 @@ if "qr_token" in query:
     st.write(f"Logged in as: **{approving_user}**")
 
     if st.button("Approve Login"):
-        # Approve QR login with real user
         c.execute("UPDATE qr_tokens SET status='approved', username=? WHERE token=?",
                   (approving_user, token))
         conn.commit()
@@ -193,7 +211,6 @@ def unlink_device():
 def qr_login():
     st.title("QR Login")
 
-    # Persistent QR token in session_state
     if "qr_token" not in st.session_state:
         token = str(uuid.uuid4())
         st.session_state["qr_token"] = token
@@ -213,7 +230,8 @@ def qr_login():
     st.image(buf.getvalue())
     st.write("Scan this with your logged-in device")
 
-    # Auto-check QR status
+    status_placeholder = st.empty()
+    # Auto-poll the token
     c.execute("SELECT username, status FROM qr_tokens WHERE token=?", (token,))
     row = c.fetchone()
     if row and row[1] == "approved" and row[0]:
@@ -221,7 +239,7 @@ def qr_login():
         st.success(f"Logged in as {row[0]} successfully")
         st.experimental_rerun()
     else:
-        st.warning("Waiting for approval...")
+        status_placeholder.warning("Waiting for approval...")
 
 # ------------------------
 # DASHBOARD
