@@ -7,9 +7,10 @@ from io import BytesIO
 from datetime import datetime
 import random
 
-# -----------------------------
+# -------------------------
 # DATABASE
-# -----------------------------
+# -------------------------
+
 conn = sqlite3.connect("auth.db", check_same_thread=False)
 c = conn.cursor()
 
@@ -39,9 +40,10 @@ status TEXT
 
 conn.commit()
 
-# -----------------------------
+# -------------------------
 # HELPERS
-# -----------------------------
+# -------------------------
+
 def hash_text(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -49,9 +51,10 @@ def get_device_hash():
     device = st.session_state.get("device","unknown_device")
     return hash_text(device)
 
-# -----------------------------
-# ML RISK (dummy model)
-# -----------------------------
+# -------------------------
+# ML RISK DEMO
+# -------------------------
+
 def predict_risk(device, ip, hour):
 
     score = random.uniform(0,1)
@@ -65,9 +68,41 @@ def predict_risk(device, ip, hour):
 
     return round(score,2), status
 
-# -----------------------------
+# -------------------------
+# HANDLE QR APPROVAL
+# -------------------------
+
+query_params = st.query_params
+
+if "qr_token" in query_params:
+
+    token = query_params["qr_token"]
+
+    c.execute("SELECT username,status FROM qr_tokens WHERE token=?", (token,))
+    result = c.fetchone()
+
+    if result and result[1] == "pending":
+
+        st.title("Approve Login Request")
+
+        st.write("User:", result[0])
+
+        if st.button("Approve Login"):
+
+            c.execute(
+                "UPDATE qr_tokens SET status='approved' WHERE token=?",
+                (token,)
+            )
+            conn.commit()
+
+            st.success("Login approved. You may close this page.")
+
+            st.stop()
+
+# -------------------------
 # REGISTER
-# -----------------------------
+# -------------------------
+
 def register():
 
     st.title("Register")
@@ -84,9 +119,10 @@ def register():
 
         st.success("Account created")
 
-# -----------------------------
+# -------------------------
 # LOGIN
-# -----------------------------
+# -------------------------
+
 def login():
 
     st.title("Login")
@@ -109,9 +145,22 @@ def login():
         else:
             st.error("Invalid credentials")
 
-# -----------------------------
+# -------------------------
+# LOGOUT
+# -------------------------
+
+def logout():
+
+    if st.sidebar.button("Logout"):
+
+        st.session_state.clear()
+        st.success("Logged out")
+        st.rerun()
+
+# -------------------------
 # LINK DEVICE
-# -----------------------------
+# -------------------------
+
 def link_device():
 
     st.header("Link This Device")
@@ -127,16 +176,41 @@ def link_device():
 
         st.success("Device linked")
 
-# -----------------------------
+# -------------------------
+# UNLINK DEVICE
+# -------------------------
+
+def unlink_device():
+
+    st.header("Unlink Device")
+
+    device_hash = get_device_hash()
+
+    if st.button("Unlink This Device"):
+
+        c.execute(
+        "DELETE FROM devices WHERE username=? AND device_hash=?",
+        (st.session_state["user"],device_hash)
+        )
+
+        conn.commit()
+
+        st.success("Device removed")
+
+# -------------------------
 # QR LOGIN
-# -----------------------------
+# -------------------------
+
 def qr_login():
 
     st.header("QR Login")
 
     token = str(uuid.uuid4())
 
-    c.execute("INSERT INTO qr_tokens VALUES(?,?,?)",(token,"pending","pending"))
+    c.execute(
+        "INSERT INTO qr_tokens(token,username,status) VALUES(?,?,?)",
+        (token, st.session_state["user"], "pending")
+    )
     conn.commit()
 
     base_url = st.secrets.get("APP_URL","http://localhost:8501")
@@ -152,9 +226,20 @@ def qr_login():
 
     st.write("Scan QR with trusted device")
 
-# -----------------------------
+    if st.button("Check Login Status"):
+
+        c.execute("SELECT status FROM qr_tokens WHERE token=?", (token,))
+        status = c.fetchone()[0]
+
+        if status == "approved":
+            st.success("Login successful!")
+        else:
+            st.warning("Waiting for approval...")
+
+# -------------------------
 # DASHBOARD
-# -----------------------------
+# -------------------------
+
 def dashboard():
 
     st.title("ML Authentication Dashboard")
@@ -179,13 +264,13 @@ def dashboard():
     for d in devices:
         st.code(d[0][:20])
 
-# -----------------------------
-# MAIN
-# -----------------------------
+# -------------------------
+# MENU
+# -------------------------
+
 menu = st.sidebar.selectbox("Menu",[
 "Login",
-"Register",
-"QR Login"
+"Register"
 ])
 
 if menu == "Login":
@@ -194,16 +279,19 @@ if menu == "Login":
 if menu == "Register":
     register()
 
-if menu == "QR Login":
-    qr_login()
+# -------------------------
+# USER PANEL
+# -------------------------
 
 if "user" in st.session_state:
 
-    st.sidebar.success("Logged in")
+    logout()
 
     page = st.sidebar.selectbox("Dashboard",[
     "Dashboard",
-    "Link Device"
+    "Link Device",
+    "Unlink Device",
+    "QR Login"
     ])
 
     if page == "Dashboard":
@@ -211,3 +299,9 @@ if "user" in st.session_state:
 
     if page == "Link Device":
         link_device()
+
+    if page == "Unlink Device":
+        unlink_device()
+
+    if page == "QR Login":
+        qr_login()
