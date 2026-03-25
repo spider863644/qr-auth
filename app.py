@@ -77,7 +77,6 @@ c.execute("""
 CREATE TABLE IF NOT EXISTS qr_tokens(
     token TEXT PRIMARY KEY,
     username TEXT,
-    requested_username TEXT,
     status TEXT NOT NULL,
     created_at TEXT NOT NULL
 )
@@ -96,12 +95,6 @@ conn.commit()
 # =========================================================
 # MIGRATIONS
 # =========================================================
-def column_exists(table_name, column_name):
-    c.execute(f"PRAGMA table_info({table_name})")
-    cols = [row[1] for row in c.fetchall()]
-    return column_name in cols
-
-
 def ensure_devices_unique_constraint():
     c.execute("PRAGMA index_list(devices)")
     indexes = c.fetchall()
@@ -133,10 +126,6 @@ def ensure_devices_unique_constraint():
 
 
 ensure_devices_unique_constraint()
-
-if not column_exists("qr_tokens", "requested_username"):
-    c.execute("ALTER TABLE qr_tokens ADD COLUMN requested_username TEXT")
-    conn.commit()
 
 # =========================================================
 # HELPERS
@@ -182,19 +171,6 @@ def predict_risk(device: str, ip: str, hour: int):
     else:
         status = "High Risk"
     return round(score, 2), status
-
-
-def is_device_linked(username: str, device_hash_value: str) -> bool:
-    c.execute(
-        "SELECT 1 FROM devices WHERE username=? AND device_hash=?",
-        (username, device_hash_value)
-    )
-    return c.fetchone() is not None
-
-
-def get_user_device_count(username: str) -> int:
-    c.execute("SELECT COUNT(*) FROM devices WHERE username=?", (username,))
-    return c.fetchone()[0]
 
 
 # =========================================================
@@ -311,21 +287,20 @@ def logout_user():
     st.rerun()
 
 
+# restore session on app load
 existing_user = get_session_user()
 if existing_user:
     st.session_state["user"] = existing_user
 
+
 # =========================================================
 # QR TOKEN HELPERS
 # =========================================================
-def create_qr_token(requested_username: str = ""):
+def create_qr_token():
     token = str(uuid.uuid4())
     c.execute(
-        """
-        INSERT INTO qr_tokens(token, username, requested_username, status, created_at)
-        VALUES (?, ?, ?, ?, ?)
-        """,
-        (token, "", requested_username, "pending", now_iso())
+        "INSERT INTO qr_tokens(token, username, status, created_at) VALUES (?, ?, ?, ?)",
+        (token, "", "pending", now_iso())
     )
     conn.commit()
     return token
@@ -333,24 +308,16 @@ def create_qr_token(requested_username: str = ""):
 
 def get_qr_status(token: str):
     c.execute(
-        """
-        SELECT username, requested_username, status, created_at
-        FROM qr_tokens
-        WHERE token=?
-        """,
+        "SELECT username, status, created_at FROM qr_tokens WHERE token=?",
         (token,)
     )
     return c.fetchone()
 
 
-def approve_qr_token(token: str, approving_username: str):
+def approve_qr_token(token: str, username: str):
     c.execute(
-        """
-        UPDATE qr_tokens
-        SET username=?, status='approved'
-        WHERE token=? AND status='pending'
-        """,
-        (approving_username, token)
+        "UPDATE qr_tokens SET username=?, status='approved' WHERE token=? AND status='pending'",
+        (username, token)
     )
     conn.commit()
 
@@ -368,19 +335,9 @@ def qr_is_expired(created_at: str) -> bool:
 
 
 # =========================================================
-# LOGIN HELPERS
-# =========================================================
-def start_new_device_qr_flow(username: str):
-    token = create_qr_token(requested_username=username)
-    st.session_state["qr_token"] = token
-    st.session_state["pending_login_username"] = username
-    return token
-
-
-# =========================================================
 # SHARED LOGIN FORM
 # =========================================================
-def login_form(title="Login", button_key="login_button", redirect_untrusted_to_qr=False):
+def login_form(title="Login", button_key="login_button"):
     st.title(title)
 
     username = st.text_input("Username", key=f"{button_key}_username")
@@ -395,30 +352,13 @@ def login_form(title="Login", button_key="login_button", redirect_untrusted_to_q
         )
         user = c.fetchone()
 
-        if not user:
+        if user:
+            create_session(username)
+            st.success("Logged in successfully.")
+            time.sleep(0.5)
+            return True
+        else:
             st.error("Invalid username or password.")
-            return False
-
-        current_hash = device_hash()
-
-        if redirect_untrusted_to_qr:
-            device_count = get_user_device_count(username)
-
-            # allow normal login if:
-            # 1. user has no trusted devices yet
-            # 2. or current device is already trusted
-            if device_count == 0 or is_device_linked(username, current_hash):
-                pass
-            else:
-                start_new_device_qr_flow(username)
-                st.warning("This device is not trusted. Approval from a linked device is required.")
-                time.sleep(0.7)
-                st.rerun()
-
-        create_session(username)
-        st.success("Logged in successfully.")
-        time.sleep(0.5)
-        return True
 
     return False
 
@@ -445,21 +385,7 @@ def register():
                 (username, hash_text(password))
             )
             conn.commit()
-
-            # trust registration device first
-            current_hash = device_hash()
-            c.execute(
-                "INSERT OR IGNORE INTO devices(username, device_hash) VALUES (?, ?)",
-                (username, current_hash)
-            )
-            conn.commit()
-
-            create_session(username)
-
-            st.success("Account created successfully. This device has been added as your first trusted device.")
-            time.sleep(0.8)
-            st.rerun()
-
+            st.success("Account created successfully.")
         except sqlite3.IntegrityError:
             st.error("Username already exists.")
 
@@ -468,18 +394,13 @@ def register():
 # NORMAL LOGIN PAGE
 # =========================================================
 def login():
-    success = login_form(
-        title="Login",
-        button_key="main_login_button",
-        redirect_untrusted_to_qr=True
-    )
+    success = login_form(title="Login", button_key="main_login_button")
     if success:
         st.rerun()
 
 
 # =========================================================
 # QR APPROVAL PAGE
-# STRICT MODE
 # =========================================================
 def qr_approval_page(token: str):
     st.title("Approve QR Login")
@@ -489,7 +410,7 @@ def qr_approval_page(token: str):
         st.error("This QR request does not exist or has expired.")
         st.stop()
 
-    approved_username, requested_username, status, created_at = row
+    requested_username, status, created_at = row
 
     if qr_is_expired(created_at):
         delete_qr_token(token)
@@ -505,32 +426,15 @@ def qr_approval_page(token: str):
 
     if not approving_user:
         st.info("Log in on this page to approve the QR login.")
-        success = login_form(
-            title="Login to Approve",
-            button_key="qr_approval_login_button",
-            redirect_untrusted_to_qr=False
-        )
+        success = login_form(title="Login to Approve", button_key="qr_approval_login_button")
         if success:
             st.rerun()
         st.stop()
 
-    current_hash = device_hash()
-
-    if requested_username and approving_user != requested_username:
-        st.error("Only the same user account can approve this login.")
-        st.info(f"This login request is for: {requested_username}")
-        st.stop()
-
-    if not is_device_linked(approving_user, current_hash):
-        st.error("This device is not trusted and cannot approve QR login.")
-        st.info("Use one of your linked devices to approve this login.")
-        st.stop()
-
     st.success(f"Logged in as: {approving_user}")
-    st.info("This is a trusted device.")
 
     if status == "approved":
-        st.info(f"This login has already been approved for {approved_username}.")
+        st.info(f"This login has already been approved for {requested_username}.")
         st.stop()
 
     if st.button("Approve Login", key="approve_qr_button", use_container_width=True):
@@ -594,7 +498,7 @@ def unlink_device():
 
 
 # =========================================================
-# QR LOGIN PAGE
+# QR LOGIN PAGE (PC / LAPTOP)
 # =========================================================
 def qr_login():
     st.title("QR Login")
@@ -606,12 +510,11 @@ def qr_login():
 
     row = get_qr_status(token)
     if not row:
-        requested_username = st.session_state.get("pending_login_username", "")
-        st.session_state["qr_token"] = create_qr_token(requested_username=requested_username)
+        st.session_state["qr_token"] = create_qr_token()
         token = st.session_state["qr_token"]
         row = get_qr_status(token)
 
-    approved_username, requested_username, status, created_at = row
+    username, status, created_at = row
 
     if qr_is_expired(created_at):
         delete_qr_token(token)
@@ -628,10 +531,7 @@ def qr_login():
     buf = BytesIO()
     qr.save(buf)
 
-    st.image(buf.getvalue(), caption="Scan this with your trusted linked device", use_container_width=False)
-
-    if requested_username:
-        st.info(f"Pending login for: {requested_username}")
+    st.image(buf.getvalue(), caption="Scan this with your phone", use_container_width=False)
 
     created_dt = parse_iso(created_at)
     remaining = timedelta(minutes=QR_MINUTES) - (datetime.now() - created_dt)
@@ -641,35 +541,23 @@ def qr_login():
 
     st.caption(f"Expires in {minutes:02d}:{seconds:02d}")
 
-    if status == "approved" and approved_username:
-        if requested_username and approved_username != requested_username:
-            st.error("Approval account mismatch. Login blocked.")
-            delete_qr_token(token)
-            if "qr_token" in st.session_state:
-                del st.session_state["qr_token"]
-            st.stop()
-
-        create_session(approved_username)
+    if status == "approved" and username:
+        create_session(username)
         delete_qr_token(token)
-
         if "qr_token" in st.session_state:
             del st.session_state["qr_token"]
-        if "pending_login_username" in st.session_state:
-            del st.session_state["pending_login_username"]
-
-        st.success(f"Logged in as {approved_username}.")
+        st.success(f"Logged in as {username}.")
         time.sleep(0.8)
         st.rerun()
     else:
-        st.warning("Waiting for approval from a trusted linked device...")
+        st.warning("Waiting for approval...")
 
         col1, col2 = st.columns(2)
 
         with col1:
             if st.button("Generate New QR", key="new_qr_button", use_container_width=True):
                 delete_qr_token(token)
-                requested_username = st.session_state.get("pending_login_username", "")
-                st.session_state["qr_token"] = create_qr_token(requested_username=requested_username)
+                st.session_state["qr_token"] = create_qr_token()
                 st.rerun()
 
         with col2:
@@ -726,17 +614,14 @@ if "qr_token" in query:
 # MAIN APP
 # =========================================================
 if "user" not in st.session_state:
-    if "qr_token" in st.session_state and "pending_login_username" in st.session_state:
-        qr_login()
-    else:
-        menu = st.sidebar.selectbox("Menu", ["Login", "Register", "QR Login"], key="main_menu")
+    menu = st.sidebar.selectbox("Menu", ["Login", "Register", "QR Login"], key="main_menu")
 
-        if menu == "Login":
-            login()
-        elif menu == "Register":
-            register()
-        elif menu == "QR Login":
-            qr_login()
+    if menu == "Login":
+        login()
+    elif menu == "Register":
+        register()
+    elif menu == "QR Login":
+        qr_login()
 else:
     if st.sidebar.button("Logout", key="logout_button", use_container_width=True):
         logout_user()
