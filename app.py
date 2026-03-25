@@ -119,7 +119,6 @@ if "qr_token" in query:
     token = query["qr_token"][0]
     st.title("Approve QR Login")
 
-    # Check who is logged in on this device
     approving_user = get_session()
     if not approving_user:
         st.warning("You must be logged in to approve this login.")
@@ -128,7 +127,7 @@ if "qr_token" in query:
     st.write(f"Logged in as: **{approving_user}**")
 
     if st.button("Approve Login"):
-        # Set the QR token's username to the approving user
+        # Approve QR login with real user
         c.execute("UPDATE qr_tokens SET status='approved', username=? WHERE token=?",
                   (approving_user, token))
         conn.commit()
@@ -193,28 +192,36 @@ def unlink_device():
 # ------------------------
 def qr_login():
     st.title("QR Login")
-    token = str(uuid.uuid4())
-    now = datetime.now().isoformat()
-    c.execute("INSERT INTO qr_tokens(token,username,status,created_at) VALUES(?,?,?,?)",
-              (token, "", "pending", now))
-    conn.commit()
+
+    # Persistent QR token in session_state
+    if "qr_token" not in st.session_state:
+        token = str(uuid.uuid4())
+        st.session_state["qr_token"] = token
+        now = datetime.now().isoformat()
+        c.execute("INSERT INTO qr_tokens(token,username,status,created_at) VALUES(?,?,?,?)",
+                  (token, "", "pending", now))
+        conn.commit()
+    else:
+        token = st.session_state["qr_token"]
+
     base_url = st.secrets.get("APP_URL", "http://localhost:8501")
     url = f"{base_url}/?qr_token={token}"
+
     qr = qrcode.make(url)
     buf = BytesIO()
     qr.save(buf)
     st.image(buf.getvalue())
     st.write("Scan this with your logged-in device")
 
-    if st.button("Check Status"):
-        c.execute("SELECT username, status FROM qr_tokens WHERE token=?", (token,))
-        row = c.fetchone()
-        if row and row[1] == "approved" and row[0]:
-            create_session(row[0])  # Log in as the approving user
-            st.success(f"Logged in as {row[0]} successfully")
-            st.experimental_rerun()
-        else:
-            st.warning("Waiting for approval")
+    # Auto-check QR status
+    c.execute("SELECT username, status FROM qr_tokens WHERE token=?", (token,))
+    row = c.fetchone()
+    if row and row[1] == "approved" and row[0]:
+        create_session(row[0])
+        st.success(f"Logged in as {row[0]} successfully")
+        st.experimental_rerun()
+    else:
+        st.warning("Waiting for approval...")
 
 # ------------------------
 # DASHBOARD
