@@ -65,7 +65,7 @@ def device_hash():
 
 def create_session(username):
     session_id = str(uuid.uuid4())
-    now = datetime.now()
+    now = datetime.now().isoformat()
     c.execute("INSERT INTO sessions(session_id, username, created_at) VALUES(?,?,?)",
               (session_id, username, now))
     conn.commit()
@@ -114,14 +114,14 @@ def predict_risk(device, ip, hour):
 # ------------------------
 # QR APPROVAL (PHONE)
 # ------------------------
-query = st.experimental_get_query_params()
+query = st.query_params
 if "qr_token" in query:
     token = query["qr_token"][0]
     st.title("Approve QR Login")
     if st.button("Approve Login"):
         # Approve without username/password
-        c.execute("UPDATE qr_tokens SET status='approved', username=? WHERE token=?",
-                  ("approved_user", token))
+        c.execute("UPDATE qr_tokens SET status='approved', username='approved_user' WHERE token=?",
+                  (token,))
         conn.commit()
         st.success("Login approved. You may close this tab.")
     st.stop()
@@ -185,7 +185,7 @@ def unlink_device():
 def qr_login():
     st.title("QR Login")
     token = str(uuid.uuid4())
-    now = datetime.now()
+    now = datetime.now().isoformat()
     c.execute("INSERT INTO qr_tokens(token,username,status,created_at) VALUES(?,?,?,?)",
               (token, "", "pending", now))
     conn.commit()
