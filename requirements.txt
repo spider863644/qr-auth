@@ -2,3 +2,4 @@ streamlit
 qrcode
 pillow
 extra-streamlit-components
+streamlit-autorefresh
