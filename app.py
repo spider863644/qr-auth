@@ -80,6 +80,42 @@ conn.commit()
 
 
 # =========================================================
+# MIGRATIONS
+# =========================================================
+def ensure_devices_unique_constraint():
+    c.execute("PRAGMA index_list(devices)")
+    indexes = c.fetchall()
+
+    has_unique = False
+    for idx in indexes:
+        if len(idx) > 2 and idx[2] == 1:
+            has_unique = True
+            break
+
+    if not has_unique:
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS devices_new(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            device_hash TEXT NOT NULL,
+            UNIQUE(username, device_hash)
+        )
+        """)
+
+        c.execute("""
+        INSERT OR IGNORE INTO devices_new(username, device_hash)
+        SELECT username, device_hash FROM devices
+        """)
+
+        c.execute("DROP TABLE devices")
+        c.execute("ALTER TABLE devices_new RENAME TO devices")
+        conn.commit()
+
+
+ensure_devices_unique_constraint()
+
+
+# =========================================================
 # HELPERS
 # =========================================================
 def now_iso() -> str:
@@ -94,11 +130,24 @@ def hash_text(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def get_or_create_device_id():
+    cookies = load_cookies_once()
+    device_id = cookies.get("device_id")
+
+    if not device_id:
+        device_id = str(uuid.uuid4())
+        cookie_manager.set("device_id", device_id)
+
+        if "_cookies_cache" not in st.session_state:
+            st.session_state["_cookies_cache"] = {}
+
+        st.session_state["_cookies_cache"]["device_id"] = device_id
+
+    return device_id
+
+
 def device_hash() -> str:
-    headers = getattr(st.context, "headers", {})
-    user_agent = headers.get("user-agent", "unknown")
-    ip = headers.get("x-forwarded-for", "unknown")
-    return hash_text(f"{user_agent}|{ip}")
+    return hash_text(get_or_create_device_id())
 
 
 def predict_risk(device: str, ip: str, hour: int):
@@ -158,7 +207,7 @@ def create_session(username: str):
     conn.commit()
 
     cookie_manager.set("user_session", session_id)
-    st.session_state["_cookies_cache"] = {"user_session": session_id}
+    st.session_state["_cookies_cache"]["user_session"] = session_id
     st.session_state["user"] = username
     st.session_state["session_id"] = session_id
 
@@ -204,10 +253,19 @@ def logout_user():
         conn.commit()
 
     cookie_manager.delete("user_session")
+
+    existing_device_id = None
+    cookies = load_cookies_once()
+    if cookies.get("device_id"):
+        existing_device_id = cookies.get("device_id")
+
     clear_cookie_cache()
 
+    if existing_device_id:
+        st.session_state["_cookies_cache"]["device_id"] = existing_device_id
+
     for key in list(st.session_state.keys()):
-        if key != "_cookies_cache":
+        if key not in ["_cookies_cache"]:
             del st.session_state[key]
 
     st.rerun()
@@ -350,7 +408,6 @@ def qr_approval_page(token: str):
 
     approving_user = get_session_user()
 
-    # If user is not logged in in this new tab/browser, let them log in here.
     if not approving_user:
         st.info("Log in on this page to approve the QR login.")
         success = login_form(title="Login to Approve", button_key="qr_approval_login_button")
@@ -388,14 +445,17 @@ def link_device():
         exists = c.fetchone()
 
         if exists:
-            st.info("This device is already linked.")
+            st.warning("This device is already linked to your account.")
         else:
-            c.execute(
-                "INSERT INTO devices(username, device_hash) VALUES (?, ?)",
-                (current_user, current_hash)
-            )
-            conn.commit()
-            st.success("Device linked.")
+            try:
+                c.execute(
+                    "INSERT INTO devices(username, device_hash) VALUES (?, ?)",
+                    (current_user, current_hash)
+                )
+                conn.commit()
+                st.success("Device linked successfully.")
+            except sqlite3.IntegrityError:
+                st.warning("This device is already linked to your account.")
 
 
 def unlink_device():
@@ -405,11 +465,20 @@ def unlink_device():
 
     if st.button("Unlink this device", key="unlink_device_button", use_container_width=True):
         c.execute(
-            "DELETE FROM devices WHERE username=? AND device_hash=?",
+            "SELECT id FROM devices WHERE username=? AND device_hash=?",
             (current_user, current_hash)
         )
-        conn.commit()
-        st.success("Device removed.")
+        exists = c.fetchone()
+
+        if not exists:
+            st.warning("This device is not currently linked.")
+        else:
+            c.execute(
+                "DELETE FROM devices WHERE username=? AND device_hash=?",
+                (current_user, current_hash)
+            )
+            conn.commit()
+            st.success("Device removed.")
 
 
 # =========================================================
@@ -418,7 +487,6 @@ def unlink_device():
 def qr_login():
     st.title("QR Login")
 
-    # Create the token once so reruns do not change the QR code
     if "qr_token" not in st.session_state:
         st.session_state["qr_token"] = create_qr_token()
 
@@ -479,7 +547,6 @@ def qr_login():
         with col2:
             st.link_button("Open approval link", qr_url, use_container_width=True)
 
-        # Near real-time polling
         time.sleep(1)
         st.rerun()
 
