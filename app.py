@@ -432,7 +432,25 @@ def register():
                 (username, hash_text(password))
             )
             conn.commit()
-            st.success("Account created successfully.")
+
+            # Automatically trust the registration device
+            current_hash = device_hash()
+            try:
+                c.execute(
+                    "INSERT INTO devices(username, device_hash) VALUES (?, ?)",
+                    (username, current_hash)
+                )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                pass
+
+            # Auto login after registration
+            create_session(username)
+
+            st.success("Account created successfully. This device has been added as your first trusted device.")
+            time.sleep(0.8)
+            st.rerun()
+
         except sqlite3.IntegrityError:
             st.error("Username already exists.")
 
@@ -617,7 +635,6 @@ def qr_login():
     st.caption(f"Expires in {minutes:02d}:{seconds:02d}")
 
     if status == "approved" and approved_username:
-        # extra safety: approved account must match requested account
         if requested_username and approved_username != requested_username:
             st.error("Approval account mismatch. Login blocked.")
             delete_qr_token(token)
@@ -702,7 +719,6 @@ if "qr_token" in query:
 # MAIN APP
 # =========================================================
 if "user" not in st.session_state:
-    # if a new device login created a pending qr token, show qr page directly
     if "qr_token" in st.session_state and "pending_login_username" in st.session_state:
         qr_login()
     else:
