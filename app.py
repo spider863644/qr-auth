@@ -6,10 +6,23 @@ import qrcode
 from io import BytesIO
 from datetime import datetime
 import random
+import extra_streamlit_components as stx
 
-# --------------------
+# ------------------------
+# COOKIE MANAGER
+# ------------------------
+
+cookie_manager = stx.CookieManager()
+
+cookies = cookie_manager.get_all()
+
+# restore login from cookie
+if "user" not in st.session_state and cookies.get("user"):
+    st.session_state["user"] = cookies.get("user")
+
+# ------------------------
 # DATABASE
-# --------------------
+# ------------------------
 
 conn = sqlite3.connect("auth.db", check_same_thread=False)
 c = conn.cursor()
@@ -39,9 +52,9 @@ status TEXT
 
 conn.commit()
 
-# --------------------
+# ------------------------
 # HELPERS
-# --------------------
+# ------------------------
 
 def hash_text(t):
     return hashlib.sha256(t.encode()).hexdigest()
@@ -49,9 +62,9 @@ def hash_text(t):
 def device_hash():
     return hash_text("demo_device")
 
-# --------------------
+# ------------------------
 # ML RISK DEMO
-# --------------------
+# ------------------------
 
 def predict_risk(device,ip,hour):
 
@@ -66,11 +79,11 @@ def predict_risk(device,ip,hour):
 
     return round(score,2),status
 
-# --------------------
+# ------------------------
 # QR APPROVAL (PHONE)
-# --------------------
+# ------------------------
 
-query=st.query_params
+query = st.query_params
 
 if "qr_token" in query:
 
@@ -85,7 +98,7 @@ if "qr_token" in query:
 
     if row and row[0]=="pending":
 
-        st.title("Approve Login")
+        st.title("Approve Login Request")
 
         if st.button("Approve Login"):
 
@@ -96,12 +109,12 @@ if "qr_token" in query:
 
             conn.commit()
 
-            st.success("Login approved")
+            st.success("Login approved. You can close this tab.")
             st.stop()
 
-# --------------------
+# ------------------------
 # REGISTER
-# --------------------
+# ------------------------
 
 def register():
 
@@ -121,9 +134,9 @@ def register():
 
         st.success("Account created")
 
-# --------------------
+# ------------------------
 # LOGIN
-# --------------------
+# ------------------------
 
 def login():
 
@@ -142,26 +155,30 @@ def login():
         if c.fetchone():
 
             st.session_state["user"]=u
+            cookie_manager.set("user",u)
+
             st.success("Logged in")
             st.rerun()
 
         else:
             st.error("Invalid login")
 
-# --------------------
+# ------------------------
 # LOGOUT
-# --------------------
+# ------------------------
 
 def logout():
 
     if st.sidebar.button("Logout"):
 
+        cookie_manager.delete("user")
+
         st.session_state.clear()
         st.rerun()
 
-# --------------------
+# ------------------------
 # LINK DEVICE
-# --------------------
+# ------------------------
 
 def link_device():
 
@@ -178,9 +195,9 @@ def link_device():
 
         st.success("Device linked")
 
-# --------------------
+# ------------------------
 # UNLINK DEVICE
-# --------------------
+# ------------------------
 
 def unlink_device():
 
@@ -197,9 +214,9 @@ def unlink_device():
 
         st.success("Device removed")
 
-# --------------------
+# ------------------------
 # QR LOGIN (LAPTOP)
-# --------------------
+# ------------------------
 
 def qr_login():
 
@@ -225,7 +242,7 @@ def qr_login():
 
     st.image(buf.getvalue())
 
-    st.write("Scan with your logged-in device")
+    st.write("Scan this with your logged-in device")
 
     if st.button("Check Status"):
 
@@ -239,15 +256,17 @@ def qr_login():
         if row and row[1]=="approved":
 
             st.session_state["user"]=row[0]
+            cookie_manager.set("user",row[0])
+
             st.success("Logged in successfully")
             st.rerun()
 
         else:
             st.warning("Waiting for approval")
 
-# --------------------
+# ------------------------
 # DASHBOARD
-# --------------------
+# ------------------------
 
 def dashboard():
 
@@ -271,13 +290,16 @@ def dashboard():
     for d in c.fetchall():
         st.code(d[0][:20])
 
-# --------------------
+# ------------------------
 # MENU
-# --------------------
+# ------------------------
 
 if "user" not in st.session_state:
 
-    menu=st.sidebar.selectbox("Menu",["Login","Register","QR Login"])
+    menu=st.sidebar.selectbox(
+        "Menu",
+        ["Login","Register","QR Login"]
+    )
 
     if menu=="Login":
         login()
@@ -293,8 +315,8 @@ else:
     logout()
 
     page=st.sidebar.selectbox(
-    "Dashboard",
-    ["Dashboard","Link Device","Unlink Device"]
+        "Dashboard",
+        ["Dashboard","Link Device","Unlink Device"]
     )
 
     if page=="Dashboard":
