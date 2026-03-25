@@ -3,3 +3,4 @@ qrcode
 pillow
 extra-streamlit-components
 streamlit-autorefresh
+scikit-learn
