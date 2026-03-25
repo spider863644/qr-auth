@@ -37,6 +37,20 @@ def clear_cookie_cache():
     st.session_state["_cookies_cache"] = {}
 
 
+def safe_delete_cookie(cookie_name: str):
+    cookies = load_cookies_once()
+    if cookies.get(cookie_name) is not None:
+        try:
+            cookie_manager.delete(cookie_name)
+        except Exception:
+            pass
+
+    if "_cookies_cache" not in st.session_state:
+        st.session_state["_cookies_cache"] = {}
+
+    st.session_state["_cookies_cache"].pop(cookie_name, None)
+
+
 # =========================================================
 # DATABASE
 # =========================================================
@@ -78,7 +92,6 @@ CREATE TABLE IF NOT EXISTS sessions(
 
 conn.commit()
 
-
 # =========================================================
 # MIGRATIONS
 # =========================================================
@@ -113,7 +126,6 @@ def ensure_devices_unique_constraint():
 
 
 ensure_devices_unique_constraint()
-
 
 # =========================================================
 # HELPERS
@@ -188,7 +200,6 @@ def cleanup_old_entries():
 
 cleanup_old_entries()
 
-
 # =========================================================
 # SESSION MANAGEMENT
 # =========================================================
@@ -207,6 +218,10 @@ def create_session(username: str):
     conn.commit()
 
     cookie_manager.set("user_session", session_id)
+
+    if "_cookies_cache" not in st.session_state:
+        st.session_state["_cookies_cache"] = {}
+
     st.session_state["_cookies_cache"]["user_session"] = session_id
     st.session_state["user"] = username
     st.session_state["session_id"] = session_id
@@ -222,7 +237,9 @@ def get_session_user():
         (session_id,)
     )
     row = c.fetchone()
+
     if not row:
+        safe_delete_cookie("user_session")
         return None
 
     username, created_at = row
@@ -232,14 +249,14 @@ def get_session_user():
     except Exception:
         c.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
         conn.commit()
-        cookie_manager.delete("user_session")
+        safe_delete_cookie("user_session")
         clear_cookie_cache()
         return None
 
     if datetime.now() - created_dt > timedelta(hours=SESSION_HOURS):
         c.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
         conn.commit()
-        cookie_manager.delete("user_session")
+        safe_delete_cookie("user_session")
         clear_cookie_cache()
         return None
 
@@ -252,20 +269,19 @@ def logout_user():
         c.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
         conn.commit()
 
-    cookie_manager.delete("user_session")
-
     existing_device_id = None
     cookies = load_cookies_once()
     if cookies.get("device_id"):
         existing_device_id = cookies.get("device_id")
 
+    safe_delete_cookie("user_session")
     clear_cookie_cache()
 
     if existing_device_id:
         st.session_state["_cookies_cache"]["device_id"] = existing_device_id
 
     for key in list(st.session_state.keys()):
-        if key not in ["_cookies_cache"]:
+        if key != "_cookies_cache":
             del st.session_state[key]
 
     st.rerun()
@@ -560,8 +576,7 @@ def dashboard():
     st.title("ML Security Dashboard")
     st.write(f"Welcome, **{current_user}**")
 
-    headers = getattr(st.context, "headers", {})
-    ip = headers.get("x-forwarded-for", "127.0.0.1")
+    ip = "127.0.0.1"
     device = device_hash()
 
     score, status = predict_risk(device, ip, datetime.now().hour)
