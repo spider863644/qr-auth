@@ -87,31 +87,37 @@ query = st.query_params
 
 if "qr_token" in query:
 
-    token=query["qr_token"]
+    token = query["qr_token"]
 
-    if "user" not in st.session_state:
-        st.warning("Login first to approve QR request")
-        st.stop()
+    st.title("Approve QR Login")
 
-    c.execute("SELECT status FROM qr_tokens WHERE token=?", (token,))
-    row=c.fetchone()
+    username = st.text_input("Username")
+    password = st.text_input("Password", type="password")
 
-    if row and row[0]=="pending":
+    if st.button("Approve Login"):
 
-        st.title("Approve Login Request")
+        c.execute(
+        "SELECT * FROM users WHERE username=? AND password=?",
+        (username, hash_text(password))
+        )
 
-        if st.button("Approve Login"):
+        user = c.fetchone()
+
+        if user:
 
             c.execute(
-            "UPDATE qr_tokens SET username=?,status='approved' WHERE token=?",
-            (st.session_state["user"],token)
+            "UPDATE qr_tokens SET username=?, status='approved' WHERE token=?",
+            (username, token)
             )
 
             conn.commit()
 
-            st.success("Login approved. You can close this tab.")
-            st.stop()
+            st.success("Login approved. You may close this tab.")
 
+        else:
+            st.error("Invalid credentials")
+
+    st.stop()
 # ------------------------
 # REGISTER
 # ------------------------
