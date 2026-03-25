@@ -26,14 +26,16 @@ QR_MINUTES = 5
 # =========================================================
 cookie_manager = stx.CookieManager(key="main_cookie_manager")
 
+
 def load_cookies_once():
     if "_cookies_cache" not in st.session_state:
-        st.session_state["_cookies_cache"] = cookie_manager.get_all(key="get_all_cookies")
+        st.session_state["_cookies_cache"] = cookie_manager.get_all(key="main_cookie_load")
     return st.session_state["_cookies_cache"]
 
-def refresh_cookie_cache():
-    st.session_state["_cookies_cache"] = cookie_manager.get_all(key="refresh_get_all_cookies")
-    return st.session_state["_cookies_cache"]
+
+def clear_cookie_cache():
+    st.session_state["_cookies_cache"] = {}
+
 
 # =========================================================
 # DATABASE
@@ -76,36 +78,28 @@ CREATE TABLE IF NOT EXISTS sessions(
 
 conn.commit()
 
-# =========================================================
-# SIMPLE MIGRATION
-# =========================================================
-def column_exists(table_name, column_name):
-    c.execute(f"PRAGMA table_info({table_name})")
-    columns = [row[1] for row in c.fetchall()]
-    return column_name in columns
-
-# Example migration hook if needed later
-# if not column_exists("qr_tokens", "approved_at"):
-#     c.execute("ALTER TABLE qr_tokens ADD COLUMN approved_at TEXT")
-#     conn.commit()
 
 # =========================================================
 # HELPERS
 # =========================================================
-def now_iso():
+def now_iso() -> str:
     return datetime.now().isoformat()
+
 
 def parse_iso(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
+
 def hash_text(text: str) -> str:
     return hashlib.sha256(text.encode()).hexdigest()
+
 
 def device_hash() -> str:
     headers = getattr(st.context, "headers", {})
     user_agent = headers.get("user-agent", "unknown")
     ip = headers.get("x-forwarded-for", "unknown")
     return hash_text(f"{user_agent}|{ip}")
+
 
 def predict_risk(device: str, ip: str, hour: int):
     score = random.uniform(0, 1)
@@ -117,13 +111,13 @@ def predict_risk(device: str, ip: str, hour: int):
         status = "High Risk"
     return round(score, 2), status
 
+
 # =========================================================
 # CLEANUP
 # =========================================================
 def cleanup_old_entries():
     now = datetime.now()
 
-    # Remove expired sessions
     c.execute("SELECT session_id, created_at FROM sessions")
     for session_id, created_at in c.fetchall():
         try:
@@ -132,7 +126,6 @@ def cleanup_old_entries():
         except Exception:
             c.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
 
-    # Remove expired QR tokens
     c.execute("SELECT token, created_at FROM qr_tokens")
     for token, created_at in c.fetchall():
         try:
@@ -143,7 +136,9 @@ def cleanup_old_entries():
 
     conn.commit()
 
+
 cleanup_old_entries()
+
 
 # =========================================================
 # SESSION MANAGEMENT
@@ -151,6 +146,7 @@ cleanup_old_entries()
 def get_cookie_session_id():
     cookies = load_cookies_once()
     return cookies.get("user_session")
+
 
 def create_session(username: str):
     session_id = str(uuid.uuid4())
@@ -165,6 +161,7 @@ def create_session(username: str):
     st.session_state["_cookies_cache"] = {"user_session": session_id}
     st.session_state["user"] = username
     st.session_state["session_id"] = session_id
+
 
 def get_session_user():
     session_id = get_cookie_session_id()
@@ -187,17 +184,18 @@ def get_session_user():
         c.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
         conn.commit()
         cookie_manager.delete("user_session")
-        st.session_state["_cookies_cache"] = {}
+        clear_cookie_cache()
         return None
 
     if datetime.now() - created_dt > timedelta(hours=SESSION_HOURS):
         c.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
         conn.commit()
         cookie_manager.delete("user_session")
-        st.session_state["_cookies_cache"] = {}
+        clear_cookie_cache()
         return None
 
     return username
+
 
 def logout_user():
     session_id = get_cookie_session_id()
@@ -206,7 +204,7 @@ def logout_user():
         conn.commit()
 
     cookie_manager.delete("user_session")
-    st.session_state["_cookies_cache"] = {}
+    clear_cookie_cache()
 
     for key in list(st.session_state.keys()):
         if key != "_cookies_cache":
@@ -214,10 +212,12 @@ def logout_user():
 
     st.rerun()
 
-# Restore login from DB-backed session
+
+# restore session on app load
 existing_user = get_session_user()
 if existing_user:
     st.session_state["user"] = existing_user
+
 
 # =========================================================
 # QR TOKEN HELPERS
@@ -231,12 +231,14 @@ def create_qr_token():
     conn.commit()
     return token
 
+
 def get_qr_status(token: str):
     c.execute(
         "SELECT username, status, created_at FROM qr_tokens WHERE token=?",
         (token,)
     )
     return c.fetchone()
+
 
 def approve_qr_token(token: str, username: str):
     c.execute(
@@ -245,9 +247,11 @@ def approve_qr_token(token: str, username: str):
     )
     conn.commit()
 
+
 def delete_qr_token(token: str):
     c.execute("DELETE FROM qr_tokens WHERE token=?", (token,))
     conn.commit()
+
 
 def qr_is_expired(created_at: str) -> bool:
     try:
@@ -255,54 +259,71 @@ def qr_is_expired(created_at: str) -> bool:
     except Exception:
         return True
 
+
 # =========================================================
-# AUTH PAGES
+# SHARED LOGIN FORM
+# =========================================================
+def login_form(title="Login", button_key="login_button"):
+    st.title(title)
+
+    username = st.text_input("Username", key=f"{button_key}_username")
+    password = st.text_input("Password", type="password", key=f"{button_key}_password")
+
+    if st.button("Login", key=button_key, use_container_width=True):
+        username = username.strip()
+
+        c.execute(
+            "SELECT id FROM users WHERE username=? AND password=?",
+            (username, hash_text(password))
+        )
+        user = c.fetchone()
+
+        if user:
+            create_session(username)
+            st.success("Logged in successfully.")
+            time.sleep(0.5)
+            return True
+        else:
+            st.error("Invalid username or password.")
+
+    return False
+
+
+# =========================================================
+# REGISTER PAGE
 # =========================================================
 def register():
     st.title("Register")
 
-    u = st.text_input("Username")
-    p = st.text_input("Password", type="password")
+    username = st.text_input("Username", key="register_username")
+    password = st.text_input("Password", type="password", key="register_password")
 
-    if st.button("Register", use_container_width=True):
-        u = u.strip()
+    if st.button("Register", key="register_button", use_container_width=True):
+        username = username.strip()
 
-        if not u or not p:
+        if not username or not password:
             st.error("Username and password are required.")
             return
 
         try:
             c.execute(
                 "INSERT INTO users(username, password) VALUES (?, ?)",
-                (u, hash_text(p))
+                (username, hash_text(password))
             )
             conn.commit()
             st.success("Account created successfully.")
         except sqlite3.IntegrityError:
             st.error("Username already exists.")
 
+
+# =========================================================
+# NORMAL LOGIN PAGE
+# =========================================================
 def login():
-    st.title("Login")
+    success = login_form(title="Login", button_key="main_login_button")
+    if success:
+        st.rerun()
 
-    u = st.text_input("Username")
-    p = st.text_input("Password", type="password")
-
-    if st.button("Login", use_container_width=True):
-        u = u.strip()
-
-        c.execute(
-            "SELECT id FROM users WHERE username=? AND password=?",
-            (u, hash_text(p))
-        )
-        user = c.fetchone()
-
-        if user:
-            create_session(u)
-            st.success("Logged in successfully.")
-            time.sleep(0.5)
-            st.rerun()
-        else:
-            st.error("Invalid username or password.")
 
 # =========================================================
 # QR APPROVAL PAGE
@@ -315,34 +336,41 @@ def qr_approval_page(token: str):
         st.error("This QR request does not exist or has expired.")
         st.stop()
 
-    username, status, created_at = row
+    requested_username, status, created_at = row
 
     if qr_is_expired(created_at):
         delete_qr_token(token)
         st.error("This QR code has expired.")
         st.stop()
 
-    approving_user = get_session_user()
-    if not approving_user:
-        st.warning("You must already be logged in on this phone/browser to approve this login.")
-        st.stop()
-
-    remaining = timedelta(minutes=QR_MINUTES) - (datetime.now() - parse_iso(created_at))
+    created_dt = parse_iso(created_at)
+    remaining = timedelta(minutes=QR_MINUTES) - (datetime.now() - created_dt)
     seconds_left = max(0, int(remaining.total_seconds()))
-
-    st.info(f"Logged in as: {approving_user}")
     st.caption(f"QR expires in about {seconds_left} seconds.")
 
-    if status == "approved":
-        st.success(f"This login has already been approved for {username}.")
+    approving_user = get_session_user()
+
+    # If user is not logged in in this new tab/browser, let them log in here.
+    if not approving_user:
+        st.info("Log in on this page to approve the QR login.")
+        success = login_form(title="Login to Approve", button_key="qr_approval_login_button")
+        if success:
+            st.rerun()
         st.stop()
 
-    if st.button("Approve Login", use_container_width=True):
+    st.success(f"Logged in as: {approving_user}")
+
+    if status == "approved":
+        st.info(f"This login has already been approved for {requested_username}.")
+        st.stop()
+
+    if st.button("Approve Login", key="approve_qr_button", use_container_width=True):
         approve_qr_token(token, approving_user)
         st.success("Login approved. You can close this tab now.")
         st.stop()
 
     st.stop()
+
 
 # =========================================================
 # DEVICE PAGES
@@ -352,7 +380,7 @@ def link_device():
     current_user = st.session_state["user"]
     current_hash = device_hash()
 
-    if st.button("Link this device", use_container_width=True):
+    if st.button("Link this device", key="link_device_button", use_container_width=True):
         c.execute(
             "SELECT id FROM devices WHERE username=? AND device_hash=?",
             (current_user, current_hash)
@@ -369,12 +397,13 @@ def link_device():
             conn.commit()
             st.success("Device linked.")
 
+
 def unlink_device():
     st.subheader("Unlink Device")
     current_user = st.session_state["user"]
     current_hash = device_hash()
 
-    if st.button("Unlink this device", use_container_width=True):
+    if st.button("Unlink this device", key="unlink_device_button", use_container_width=True):
         c.execute(
             "DELETE FROM devices WHERE username=? AND device_hash=?",
             (current_user, current_hash)
@@ -382,13 +411,14 @@ def unlink_device():
         conn.commit()
         st.success("Device removed.")
 
+
 # =========================================================
 # QR LOGIN PAGE (PC / LAPTOP)
 # =========================================================
 def qr_login():
     st.title("QR Login")
 
-    # Create token once and keep it stable across reruns
+    # Create the token once so reruns do not change the QR code
     if "qr_token" not in st.session_state:
         st.session_state["qr_token"] = create_qr_token()
 
@@ -417,7 +447,7 @@ def qr_login():
     buf = BytesIO()
     qr.save(buf)
 
-    st.image(buf.getvalue(), caption="Scan this with your logged-in phone", use_container_width=False)
+    st.image(buf.getvalue(), caption="Scan this with your phone", use_container_width=False)
 
     created_dt = parse_iso(created_at)
     remaining = timedelta(minutes=QR_MINUTES) - (datetime.now() - created_dt)
@@ -439,8 +469,9 @@ def qr_login():
         st.warning("Waiting for approval...")
 
         col1, col2 = st.columns(2)
+
         with col1:
-            if st.button("Generate New QR", use_container_width=True):
+            if st.button("Generate New QR", key="new_qr_button", use_container_width=True):
                 delete_qr_token(token)
                 st.session_state["qr_token"] = create_qr_token()
                 st.rerun()
@@ -448,9 +479,10 @@ def qr_login():
         with col2:
             st.link_button("Open approval link", qr_url, use_container_width=True)
 
-        # Near real-time auto-check
+        # Near real-time polling
         time.sleep(1)
         st.rerun()
+
 
 # =========================================================
 # DASHBOARD
@@ -472,7 +504,6 @@ def dashboard():
     col2.metric("Status", status)
 
     st.subheader("Trusted Devices")
-
     c.execute(
         "SELECT device_hash FROM devices WHERE username=?",
         (current_user,)
@@ -485,6 +516,7 @@ def dashboard():
     else:
         st.info("No linked devices yet.")
 
+
 # =========================================================
 # QUERY PARAM ROUTING
 # =========================================================
@@ -495,11 +527,12 @@ if "qr_token" in query:
         token_value = token_value[0]
     qr_approval_page(token_value)
 
+
 # =========================================================
 # MAIN APP
 # =========================================================
 if "user" not in st.session_state:
-    menu = st.sidebar.selectbox("Menu", ["Login", "Register", "QR Login"])
+    menu = st.sidebar.selectbox("Menu", ["Login", "Register", "QR Login"], key="main_menu")
 
     if menu == "Login":
         login()
@@ -508,10 +541,14 @@ if "user" not in st.session_state:
     elif menu == "QR Login":
         qr_login()
 else:
-    if st.sidebar.button("Logout", use_container_width=True):
+    if st.sidebar.button("Logout", key="logout_button", use_container_width=True):
         logout_user()
 
-    page = st.sidebar.selectbox("Dashboard", ["Dashboard", "Link Device", "Unlink Device"])
+    page = st.sidebar.selectbox(
+        "Dashboard",
+        ["Dashboard", "Link Device", "Unlink Device"],
+        key="dashboard_menu"
+    )
 
     if page == "Dashboard":
         dashboard()
