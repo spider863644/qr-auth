@@ -20,7 +20,7 @@ st.set_page_config(page_title="ML QR Authentication", layout="wide")
 # Replace with your actual deployed Streamlit URL
 APP_URL = "https://your-app-name.streamlit.app"
 
-DB_NAME = "auth_ml.db"
+DB_NAME = "auth_ml2.db"
 
 # =========================================================
 # DATABASE
