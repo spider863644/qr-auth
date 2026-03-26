@@ -81,6 +81,11 @@ def init_db():
         requester_device_id TEXT NOT NULL,
         status TEXT NOT NULL,
         risk_result TEXT,
+        login_hour INTEGER,
+        failed_attempts INTEGER,
+        new_device INTEGER,
+        distance_km REAL,
+        trusted_device INTEGER,
         created_at TEXT
     )
     """)
@@ -104,6 +109,11 @@ def init_db():
     ensure_column("users", "created_at", "TEXT")
     ensure_column("devices", "created_at", "TEXT")
     ensure_column("login_requests", "risk_result", "TEXT")
+    ensure_column("login_requests", "login_hour", "INTEGER")
+    ensure_column("login_requests", "failed_attempts", "INTEGER")
+    ensure_column("login_requests", "new_device", "INTEGER")
+    ensure_column("login_requests", "distance_km", "REAL")
+    ensure_column("login_requests", "trusted_device", "INTEGER")
 
 
 with app.app_context():
@@ -279,10 +289,31 @@ def remove_device(username, device_id):
 def create_login_request(username, requester_device_id):
     db = get_db()
     token = str(uuid.uuid4())
+
+    login_hour = datetime.now().hour
+    failed_attempts = session.get("failed_attempts", 0)
+    new_device = 1
+    distance_km = round(random.uniform(1, 4000), 2)
+    trusted_device = 1
+
+    risk_label, _ = predict_risk(
+        login_hour,
+        failed_attempts,
+        new_device,
+        distance_km,
+        trusted_device
+    )
+
     db.execute("""
-        INSERT INTO login_requests(request_token, username, requester_device_id, status, risk_result, created_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (token, username, requester_device_id, "pending", "", now_str()))
+        INSERT INTO login_requests(
+            request_token, username, requester_device_id, status, risk_result,
+            login_hour, failed_attempts, new_device, distance_km, trusted_device, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        token, username, requester_device_id, "pending", risk_label,
+        login_hour, failed_attempts, new_device, distance_km, trusted_device, now_str()
+    ))
     db.commit()
     return token
 
@@ -593,11 +624,6 @@ BASE_HTML = """
             background: linear-gradient(135deg, #16a34a, #10b981);
         }
 
-        .btn-warning {
-            color: #18181b;
-            background: linear-gradient(135deg, #fbbf24, #f59e0b);
-        }
-
         .mini-grid {
             display: grid;
             grid-template-columns: repeat(2, 1fr);
@@ -679,12 +705,6 @@ BASE_HTML = """
         input:focus {
             border-color: rgba(124,58,237,0.65);
             background: rgba(255,255,255,0.06);
-        }
-
-        .input-row {
-            display: grid;
-            gap: 14px;
-            grid-template-columns: 1fr 1fr;
         }
 
         .flash-wrap {
@@ -871,10 +891,6 @@ BASE_HTML = """
             display: inline-block;
         }
 
-        .show-spinner .btn-text::after {
-            content: " Processing...";
-        }
-
         .status-banner {
             padding: 16px 18px;
             border-radius: 18px;
@@ -939,10 +955,6 @@ BASE_HTML = """
                 padding: 18px;
             }
 
-            .input-row {
-                grid-template-columns: 1fr;
-            }
-
             .mini-grid {
                 grid-template-columns: 1fr;
             }
@@ -986,7 +998,7 @@ BASE_HTML = """
         {{ body|safe }}
 
         <div class="footer-note">
-            QR Shield • Flask • SQLite • ML risk scoring • because basic-looking auth pages offend decent people
+            QR Shield • Flask • SQLite • ML risk scoring • because ugly auth pages are a crime
         </div>
     </div>
 
@@ -1019,19 +1031,17 @@ BASE_HTML = """
             setTimeout(() => toast.remove(), 2200);
         }
 
-        function lockButton(button, text) {
+        function lockButton(button) {
             if (!button) return;
             button.disabled = true;
             button.classList.add("show-spinner");
-            const txt = button.querySelector(".btn-text");
-            if (txt && text) txt.textContent = text;
         }
 
         document.addEventListener("submit", function(e) {
             const form = e.target;
             if (form.matches(".loading-form")) {
-                const btn = form.querySelector("button[type='submit']");
-                lockButton(btn, btn.dataset.loadingText || "Please wait");
+                const btn = form.querySelector("button[type='submit']:focus") || form.querySelector("button[type='submit']");
+                lockButton(btn);
             }
         });
     </script>
@@ -1070,11 +1080,10 @@ def home():
     <section class="hero">
         <div class="hero-card">
             <div class="eyebrow">Secure QR verification • Trusted devices • ML risk engine</div>
-            <h2>Authentication that looks like a real product now.</h2>
+            <h2>Authentication that behaves like a real system now.</h2>
             <p>
-                QR Shield combines username-password login, trusted device linking, QR-based approval,
+                QR Shield combines password login, trusted device linking, QR-based approval,
                 and a lightweight machine learning risk model to evaluate suspicious login attempts.
-                Finally, your app no longer looks like a classroom sacrifice.
             </p>
             <div class="hero-actions">
                 <a class="btn btn-primary" href="{url_for('register')}">Create Account</a>
@@ -1103,30 +1112,6 @@ def home():
             </div>
         </div>
     </section>
-
-    <div class="content-grid">
-        <div class="card">
-            <h3>How it works</h3>
-            <div class="mini-grid">
-                <div class="stat">
-                    <div class="label">1. Sign In</div>
-                    <div class="value">Trusted devices log in directly</div>
-                </div>
-                <div class="stat">
-                    <div class="label">2. New Device</div>
-                    <div class="value">QR approval request is generated</div>
-                </div>
-                <div class="stat">
-                    <div class="label">3. Scan QR</div>
-                    <div class="value">Trusted device opens approval page</div>
-                </div>
-                <div class="stat">
-                    <div class="label">4. ML Check</div>
-                    <div class="value">Risk score informs the approval decision</div>
-                </div>
-            </div>
-        </div>
-    </div>
     """
     return render_page("Home", body)
 
@@ -1170,7 +1155,7 @@ def register():
                     <label>Device Name</label>
                     <input name="device_name" type="text" value="{default_device_name()}">
                 </div>
-                <button class="btn btn-primary" type="submit" data-loading-text="Creating account">
+                <button class="btn btn-primary" type="submit">
                     <span class="spinner"></span>
                     <span class="btn-text">Create Account</span>
                 </button>
@@ -1221,7 +1206,7 @@ def login():
         <div class="card auth-card">
             <h2>Welcome back</h2>
             <p class="subtle">
-                Sign in normally on trusted devices. New devices will require QR approval.
+                Sign in normally on trusted devices. New devices require QR approval.
             </p>
             <form method="post" class="form-grid loading-form">
                 <input type="hidden" name="next" value="{next_url}">
@@ -1237,7 +1222,7 @@ def login():
                     <label>Current Device Name</label>
                     <input name="device_name" type="text" value="{default_device_name()}">
                 </div>
-                <button class="btn btn-primary" type="submit" data-loading-text="Signing in">
+                <button class="btn btn-primary" type="submit">
                     <span class="spinner"></span>
                     <span class="btn-text">Sign In</span>
                 </button>
@@ -1260,6 +1245,34 @@ def pending_login(token):
         flash("This browser is not the original waiting device for that request.", "error")
         return redirect(url_for("login"))
 
+    status = row["status"]
+    username = row["username"]
+
+    if status == "approved":
+        session["user"] = username
+        add_trusted_device(
+            username,
+            current_device_id(),
+            session.get("pending_login_device_name", default_device_name())
+        )
+        session.pop("pending_login_token", None)
+        session.pop("pending_login_user", None)
+        session.pop("pending_login_device_name", None)
+        flash("Login approved. This device is now trusted.", "success")
+        return redirect(url_for("dashboard"))
+
+    if status == "blocked":
+        session.pop("pending_login_token", None)
+        session.pop("pending_login_user", None)
+        session.pop("pending_login_device_name", None)
+        return render_page("Pending Login", """
+        <div class="card">
+            <h2>Pending Login</h2>
+            <div class="status-banner blocked">This login request was blocked.</div>
+            <a class="btn btn-ghost" href="/login">Back to Login</a>
+        </div>
+        """)
+
     approve_url = url_for("approve_qr", token=token, _external=True)
     qr_b64 = qr_image_data(approve_url)
 
@@ -1270,8 +1283,7 @@ def pending_login(token):
             <h2>QR Verification Needed</h2>
             <p class="subtle">
                 This device is not trusted yet. Scan the QR code with a trusted device to continue.
-                If the camera opens a new tab, log in there and it will return to the approval page.
-                Technology sometimes behaves, against all odds.
+                If your camera opens a new tab, log in there and it will return to the approval page.
             </p>
 
             <div class="link-box">
@@ -1328,7 +1340,7 @@ def pending_login(token):
                 text.textContent = "Waiting for approval from a trusted device...";
             }} else if (status === "approved") {{
                 banner.textContent = "Status: Approved";
-                text.textContent = "Approval received. Redirecting to dashboard...";
+                text.textContent = "Approval received. Redirecting...";
             }} else if (status === "blocked") {{
                 banner.textContent = "Status: Blocked";
                 text.textContent = "This login request was blocked.";
@@ -1341,14 +1353,9 @@ def pending_login(token):
                 const data = await res.json();
                 updateStatusUI(data.status);
 
-                if (data.status === "approved") {{
+                if (data.status === "approved" || data.status === "blocked") {{
                     clearInterval(pollInterval);
                     setTimeout(() => window.location.reload(), 900);
-                }}
-
-                if (data.status === "blocked") {{
-                    clearInterval(pollInterval);
-                    setTimeout(() => window.location.reload(), 1200);
                 }}
             }} catch (err) {{
                 console.error("Polling failed", err);
@@ -1397,9 +1404,6 @@ def approve_qr(token):
             <div class="status-banner blocked">
                 You are logged in as {current_user()}, but this request belongs to {username}.
             </div>
-            <p class="subtle">
-                Use the correct trusted account to approve this login. Humans and account mix-ups remain an exhausting duo.
-            </p>
         </div>
         """)
 
@@ -1413,11 +1417,11 @@ def approve_qr(token):
         </div>
         """)
 
-    login_hour = datetime.now().hour
-    failed_attempts = 0
-    new_device = 1
-    distance_km = random.uniform(1, 4000)
-    trusted_device = 1
+    login_hour = row["login_hour"]
+    failed_attempts = row["failed_attempts"]
+    new_device = row["new_device"]
+    distance_km = row["distance_km"]
+    trusted_device = row["trusted_device"]
 
     risk_label, proba = predict_risk(
         login_hour,
@@ -1524,7 +1528,7 @@ def approve_qr(token):
                 <h3>Decision</h3>
                 <p class="subtle">This request is marked high risk. Blocking is strongly recommended.</p>
                 <form method="post" class="loading-form">
-                    <button class="btn btn-danger" type="submit" name="action" value="block" data-loading-text="Blocking request">
+                    <button class="btn btn-danger" type="submit" name="action" value="block">
                         <span class="spinner"></span>
                         <span class="btn-text">Block Login</span>
                     </button>
@@ -1536,20 +1540,18 @@ def approve_qr(token):
             <div class="card">
                 <h3>Decision</h3>
                 <p class="subtle">Approve if this login is genuinely yours. Otherwise block it.</p>
-                <div style="display:flex; gap:12px; flex-wrap:wrap;">
-                    <form method="post" class="loading-form" style="margin:0;">
-                        <button class="btn btn-success" type="submit" name="action" value="approve" data-loading-text="Approving login">
+                <form method="post" class="loading-form">
+                    <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                        <button class="btn btn-success" type="submit" name="action" value="approve">
                             <span class="spinner"></span>
                             <span class="btn-text">Approve Login</span>
                         </button>
-                    </form>
-                    <form method="post" class="loading-form" style="margin:0;">
-                        <button class="btn btn-danger" type="submit" name="action" value="block" data-loading-text="Blocking login">
+                        <button class="btn btn-danger" type="submit" name="action" value="block">
                             <span class="spinner"></span>
                             <span class="btn-text">Block Login</span>
                         </button>
-                    </form>
-                </div>
+                    </div>
+                </form>
             </div>
             """
     else:
@@ -1606,7 +1608,7 @@ def dashboard():
         <div class="hero-card">
             <div class="eyebrow">Dashboard</div>
             <h2>Welcome back, {username}</h2>
-            <p>Manage trusted devices, review login requests, and keep an eye on authentication activity without the page looking like a sad spreadsheet.</p>
+            <p>Manage trusted devices, review login requests, and keep an eye on authentication activity.</p>
         </div>
 
         <div class="hero-card">
@@ -1702,7 +1704,7 @@ def admin_logs():
     <div class="content-grid" style="margin-top:20px;">
         <div class="card">
             <h2>Authentication Logs</h2>
-            <p class="subtle">A record of recent authentication outcomes, because systems without logs are just vibes and denial.</p>
+            <p class="subtle">A record of recent authentication outcomes.</p>
             <div class="table-wrap">
                 <table>
                     <tr>
