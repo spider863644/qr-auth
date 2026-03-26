@@ -11,7 +11,7 @@ import pandas as pd
 import qrcode
 from flask import (
     Flask, request, redirect, url_for, session, g,
-    make_response, render_template_string, flash
+    render_template_string, flash, jsonify
 )
 from werkzeug.security import generate_password_hash, check_password_hash
 from sklearn.ensemble import RandomForestClassifier
@@ -23,7 +23,6 @@ from sklearn.model_selection import train_test_split
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key-now")
 DB_NAME = os.environ.get("DB_NAME", "auth_flask.db")
-
 
 # =========================================================
 # DATABASE
@@ -110,7 +109,6 @@ def init_db():
 with app.app_context():
     init_db()
 
-
 # =========================================================
 # MACHINE LEARNING
 # =========================================================
@@ -179,7 +177,6 @@ def predict_risk(login_hour, failed_attempts, new_device, distance_km, trusted_d
         2: "High Risk"
     }
     return mapping[pred], proba
-
 
 # =========================================================
 # HELPERS
@@ -346,7 +343,7 @@ def get_logs():
 
 
 def qr_image_data(url_text):
-    qr = qrcode.QRCode(box_size=8, border=4)
+    qr = qrcode.QRCode(box_size=10, border=3)
     qr.add_data(url_text)
     qr.make(fit=True)
 
@@ -354,7 +351,6 @@ def qr_image_data(url_text):
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("utf-8")
-
 
 # =========================================================
 # DEVICE COOKIE
@@ -381,143 +377,755 @@ def persist_device_cookie(response):
         )
     return response
 
-
 # =========================================================
 # TEMPLATES
 # =========================================================
 BASE_HTML = """
 <!doctype html>
-<html>
+<html lang="en">
 <head>
     <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>{{ title }}</title>
-    {% if refresh %}
-    <meta http-equiv="refresh" content="{{ refresh }}">
-    {% endif %}
     <style>
+        :root {
+            --bg: #070b14;
+            --bg-soft: #0f1727;
+            --card: rgba(17, 24, 39, 0.78);
+            --card-2: rgba(15, 23, 42, 0.92);
+            --border: rgba(255,255,255,0.08);
+            --text: #e5eefc;
+            --muted: #9fb0cf;
+            --accent: #7c3aed;
+            --accent-2: #06b6d4;
+            --green: #22c55e;
+            --red: #ef4444;
+            --yellow: #f59e0b;
+            --shadow: 0 10px 30px rgba(0,0,0,0.28);
+            --radius: 22px;
+        }
+
+        * { box-sizing: border-box; }
+        html { scroll-behavior: smooth; }
+
         body {
-            font-family: Arial, sans-serif;
-            max-width: 900px;
-            margin: 30px auto;
-            padding: 0 18px;
-            line-height: 1.5;
-            background: #f7f7f8;
-            color: #111;
+            margin: 0;
+            font-family: Inter, system-ui, Arial, sans-serif;
+            color: var(--text);
+            background:
+                radial-gradient(circle at top left, rgba(124,58,237,0.18), transparent 28%),
+                radial-gradient(circle at top right, rgba(6,182,212,0.15), transparent 25%),
+                linear-gradient(180deg, #050814 0%, #0b1020 100%);
+            min-height: 100vh;
         }
-        .card {
-            background: #fff;
-            padding: 18px;
+
+        a { color: inherit; text-decoration: none; }
+
+        .shell {
+            width: min(1180px, calc(100% - 28px));
+            margin: 0 auto;
+            padding: 22px 0 40px;
+        }
+
+        .topbar {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 16px;
+            padding: 14px 18px;
+            border: 1px solid var(--border);
+            background: rgba(10, 15, 28, 0.72);
+            backdrop-filter: blur(16px);
+            border-radius: 20px;
+            box-shadow: var(--shadow);
+            position: sticky;
+            top: 14px;
+            z-index: 50;
+        }
+
+        .brand {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+        }
+
+        .brand-badge {
+            width: 42px;
+            height: 42px;
             border-radius: 14px;
-            margin-bottom: 18px;
-            box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+            background: linear-gradient(135deg, var(--accent), var(--accent-2));
+            display: grid;
+            place-items: center;
+            font-weight: 800;
+            color: white;
+            box-shadow: 0 8px 24px rgba(124,58,237,0.35);
         }
-        input, button {
-            padding: 10px;
-            margin: 6px 0;
-            width: 100%;
-            box-sizing: border-box;
+
+        .brand h1 {
+            margin: 0;
+            font-size: 17px;
+            line-height: 1.1;
         }
-        button {
-            cursor: pointer;
+
+        .brand p {
+            margin: 2px 0 0;
+            font-size: 12px;
+            color: var(--muted);
         }
-        a.button {
-            display: inline-block;
-            padding: 10px 14px;
-            background: #111;
-            color: #fff;
-            text-decoration: none;
-            border-radius: 10px;
+
+        .nav {
+            display: flex;
+            align-items: center;
+            flex-wrap: wrap;
+            gap: 10px;
         }
-        .muted { color: #666; font-size: 14px; }
-        .success { color: green; }
-        .error { color: #b00020; }
-        .warn { color: #9a6700; }
+
         .nav a {
-            margin-right: 10px;
+            padding: 10px 14px;
+            border-radius: 12px;
+            color: var(--muted);
+            transition: 0.2s ease;
         }
-        code {
-            word-break: break-all;
+
+        .nav a:hover {
+            background: rgba(255,255,255,0.05);
+            color: white;
         }
+
+        .hero {
+            margin-top: 20px;
+            display: grid;
+            grid-template-columns: 1.4fr 1fr;
+            gap: 18px;
+        }
+
+        .hero-card, .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            box-shadow: var(--shadow);
+            backdrop-filter: blur(16px);
+        }
+
+        .hero-card {
+            padding: 32px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .hero-card::before {
+            content: "";
+            position: absolute;
+            inset: auto -60px -60px auto;
+            width: 220px;
+            height: 220px;
+            border-radius: 999px;
+            background: radial-gradient(circle, rgba(124,58,237,0.24), transparent 70%);
+        }
+
+        .eyebrow {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            border-radius: 999px;
+            background: rgba(124,58,237,0.16);
+            color: #ddd6fe;
+            font-size: 12px;
+            border: 1px solid rgba(124,58,237,0.25);
+        }
+
+        .hero-card h2 {
+            font-size: clamp(28px, 5vw, 46px);
+            line-height: 1.03;
+            margin: 18px 0 12px;
+        }
+
+        .hero-card p {
+            color: var(--muted);
+            font-size: 15px;
+            max-width: 640px;
+        }
+
+        .hero-actions {
+            margin-top: 22px;
+            display: flex;
+            gap: 12px;
+            flex-wrap: wrap;
+        }
+
+        .btn {
+            border: none;
+            border-radius: 14px;
+            padding: 13px 18px;
+            font-weight: 700;
+            font-size: 14px;
+            cursor: pointer;
+            transition: transform 0.15s ease, opacity 0.15s ease, box-shadow 0.2s ease;
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 9px;
+        }
+
+        .btn:hover { transform: translateY(-1px); }
+        .btn:disabled { opacity: 0.7; cursor: not-allowed; transform: none; }
+
+        .btn-primary {
+            color: white;
+            background: linear-gradient(135deg, var(--accent), var(--accent-2));
+            box-shadow: 0 12px 30px rgba(124,58,237,0.3);
+        }
+
+        .btn-ghost {
+            color: white;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid var(--border);
+        }
+
+        .btn-danger {
+            color: white;
+            background: linear-gradient(135deg, #ef4444, #f97316);
+        }
+
+        .btn-success {
+            color: white;
+            background: linear-gradient(135deg, #16a34a, #10b981);
+        }
+
+        .btn-warning {
+            color: #18181b;
+            background: linear-gradient(135deg, #fbbf24, #f59e0b);
+        }
+
+        .mini-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 14px;
+        }
+
+        .stat {
+            padding: 18px;
+            border-radius: 18px;
+            background: rgba(255,255,255,0.04);
+            border: 1px solid var(--border);
+        }
+
+        .stat .label {
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .stat .value {
+            margin-top: 8px;
+            font-size: 18px;
+            font-weight: 800;
+            word-break: break-word;
+        }
+
+        .content-grid {
+            margin-top: 18px;
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 18px;
+        }
+
+        .auth-wrap {
+            display: grid;
+            place-items: center;
+            margin-top: 24px;
+        }
+
+        .auth-card {
+            width: min(100%, 520px);
+            padding: 26px;
+        }
+
+        .auth-card h2, .card h2, .card h3 {
+            margin-top: 0;
+            margin-bottom: 12px;
+        }
+
+        .subtle {
+            color: var(--muted);
+            font-size: 14px;
+        }
+
+        .form-grid {
+            display: grid;
+            gap: 14px;
+        }
+
+        label {
+            display: block;
+            font-size: 13px;
+            color: #c7d2fe;
+            margin-bottom: 7px;
+            font-weight: 600;
+        }
+
+        input {
+            width: 100%;
+            border: 1px solid rgba(255,255,255,0.08);
+            outline: none;
+            border-radius: 14px;
+            background: rgba(255,255,255,0.04);
+            color: white;
+            padding: 14px 15px;
+            font-size: 14px;
+            transition: border-color 0.2s ease, background 0.2s ease;
+        }
+
+        input:focus {
+            border-color: rgba(124,58,237,0.65);
+            background: rgba(255,255,255,0.06);
+        }
+
+        .input-row {
+            display: grid;
+            gap: 14px;
+            grid-template-columns: 1fr 1fr;
+        }
+
+        .flash-wrap {
+            margin-top: 18px;
+            display: grid;
+            gap: 10px;
+        }
+
+        .flash {
+            padding: 14px 16px;
+            border-radius: 16px;
+            border: 1px solid var(--border);
+            background: rgba(255,255,255,0.05);
+            box-shadow: var(--shadow);
+            animation: slideDown 0.25s ease;
+        }
+
+        .flash.success { border-color: rgba(34,197,94,0.35); background: rgba(34,197,94,0.10); }
+        .flash.error { border-color: rgba(239,68,68,0.35); background: rgba(239,68,68,0.10); }
+        .flash.warning { border-color: rgba(245,158,11,0.35); background: rgba(245,158,11,0.10); }
+        .flash.info { border-color: rgba(6,182,212,0.35); background: rgba(6,182,212,0.10); }
+
+        .card {
+            padding: 22px;
+        }
+
+        .two-col {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 18px;
+        }
+
+        .table-wrap {
+            overflow-x: auto;
+            border-radius: 18px;
+            border: 1px solid var(--border);
+        }
+
         table {
             width: 100%;
             border-collapse: collapse;
+            min-width: 640px;
         }
+
         th, td {
             text-align: left;
-            padding: 8px;
-            border-bottom: 1px solid #ddd;
+            padding: 14px 16px;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+            font-size: 14px;
+            vertical-align: top;
         }
-        .flash {
-            padding: 10px;
-            border-radius: 10px;
-            background: #eef2ff;
-            margin-bottom: 14px;
+
+        th {
+            color: #c7d2fe;
+            background: rgba(255,255,255,0.04);
+            font-size: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }
+
+        tr:hover td {
+            background: rgba(255,255,255,0.03);
+        }
+
+        .pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 7px;
+            padding: 8px 12px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 700;
+            border: 1px solid transparent;
+        }
+
+        .pill-success {
+            color: #86efac;
+            background: rgba(34,197,94,0.12);
+            border-color: rgba(34,197,94,0.25);
+        }
+
+        .pill-warning {
+            color: #fcd34d;
+            background: rgba(245,158,11,0.12);
+            border-color: rgba(245,158,11,0.25);
+        }
+
+        .pill-danger {
+            color: #fca5a5;
+            background: rgba(239,68,68,0.12);
+            border-color: rgba(239,68,68,0.25);
+        }
+
+        .pill-info {
+            color: #7dd3fc;
+            background: rgba(6,182,212,0.12);
+            border-color: rgba(6,182,212,0.25);
+        }
+
+        .qr-box {
+            display: grid;
+            place-items: center;
+            padding: 18px;
+            border-radius: 24px;
+            background: linear-gradient(180deg, rgba(255,255,255,0.07), rgba(255,255,255,0.03));
+            border: 1px solid var(--border);
+        }
+
+        .qr-box img {
+            width: min(100%, 290px);
+            background: white;
+            padding: 14px;
+            border-radius: 20px;
+        }
+
+        .link-box {
+            margin-top: 14px;
+            padding: 14px;
+            background: rgba(255,255,255,0.04);
+            border-radius: 16px;
+            border: 1px solid var(--border);
+            word-break: break-all;
+            color: #dbeafe;
+        }
+
+        .copy-row {
+            margin-top: 12px;
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+        }
+
+        .risk-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 12px;
+        }
+
+        .risk-card {
+            padding: 16px;
+            border-radius: 18px;
+            border: 1px solid var(--border);
+            background: rgba(255,255,255,0.04);
+        }
+
+        .risk-card .name {
+            color: var(--muted);
+            font-size: 12px;
+        }
+
+        .risk-card .num {
+            margin-top: 8px;
+            font-size: 24px;
+            font-weight: 800;
+        }
+
+        .empty {
+            padding: 24px;
+            text-align: center;
+            color: var(--muted);
+            border: 1px dashed rgba(255,255,255,0.12);
+            border-radius: 18px;
+            background: rgba(255,255,255,0.03);
+        }
+
+        .footer-note {
+            text-align: center;
+            color: var(--muted);
+            font-size: 12px;
+            margin-top: 20px;
+        }
+
+        .spinner {
+            display: none;
+            width: 16px;
+            height: 16px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-top-color: white;
+            border-radius: 50%;
+            animation: spin 0.7s linear infinite;
+        }
+
+        .show-spinner .spinner {
+            display: inline-block;
+        }
+
+        .show-spinner .btn-text::after {
+            content: " Processing...";
+        }
+
+        .status-banner {
+            padding: 16px 18px;
+            border-radius: 18px;
+            border: 1px solid var(--border);
+            margin-bottom: 16px;
+            font-weight: 700;
+        }
+
+        .status-banner.pending {
+            background: rgba(245,158,11,0.10);
+            color: #fcd34d;
+            border-color: rgba(245,158,11,0.25);
+        }
+
+        .status-banner.approved {
+            background: rgba(34,197,94,0.10);
+            color: #86efac;
+            border-color: rgba(34,197,94,0.25);
+        }
+
+        .status-banner.blocked {
+            background: rgba(239,68,68,0.10);
+            color: #fca5a5;
+            border-color: rgba(239,68,68,0.25);
+        }
+
+        @keyframes slideDown {
+            from { opacity: 0; transform: translateY(-8px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
+        @media (max-width: 980px) {
+            .hero, .two-col {
+                grid-template-columns: 1fr;
+            }
+
+            .risk-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (max-width: 640px) {
+            .shell {
+                width: min(100% - 18px, 1180px);
+                padding-top: 14px;
+            }
+
+            .topbar {
+                flex-direction: column;
+                align-items: stretch;
+            }
+
+            .nav {
+                justify-content: space-between;
+            }
+
+            .hero-card, .card, .auth-card {
+                padding: 18px;
+            }
+
+            .input-row {
+                grid-template-columns: 1fr;
+            }
+
+            .mini-grid {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
 <body>
-    <div class="card nav">
-        <a href="{{ url_for('home') }}">Home</a>
-        {% if user %}
-            <a href="{{ url_for('dashboard') }}">Dashboard</a>
-            <a href="{{ url_for('logout') }}">Logout</a>
-        {% else %}
-            <a href="{{ url_for('register') }}">Register</a>
-            <a href="{{ url_for('login') }}">Login</a>
-        {% endif %}
+    <div class="shell">
+        <div class="topbar">
+            <div class="brand">
+                <div class="brand-badge">Q</div>
+                <div>
+                    <h1>QR Shield</h1>
+                    <p>Machine-learning assisted device approval</p>
+                </div>
+            </div>
+
+            <div class="nav">
+                <a href="{{ url_for('home') }}">Home</a>
+                {% if user %}
+                    <a href="{{ url_for('dashboard') }}">Dashboard</a>
+                    <a href="{{ url_for('admin_logs') }}">Logs</a>
+                    <a href="{{ url_for('logout') }}">Logout</a>
+                {% else %}
+                    <a href="{{ url_for('register') }}">Register</a>
+                    <a href="{{ url_for('login') }}">Login</a>
+                {% endif %}
+            </div>
+        </div>
+
+        <div class="flash-wrap">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+              {% if messages %}
+                {% for category, message in messages %}
+                  <div class="flash {{ category }}">{{ message }}</div>
+                {% endfor %}
+              {% endif %}
+            {% endwith %}
+        </div>
+
+        {{ body|safe }}
+
+        <div class="footer-note">
+            QR Shield • Flask • SQLite • ML risk scoring • because basic-looking auth pages offend decent people
+        </div>
     </div>
 
-    <div class="card">
-        <div><strong>Current device:</strong> {{ device_name }}</div>
-        <div class="muted"><strong>Device ID:</strong> {{ device_id }}</div>
-        {% if user %}
-        <div class="muted"><strong>Logged in as:</strong> {{ user }}</div>
-        {% endif %}
-    </div>
+    <script>
+        function copyToClipboard(text) {
+            navigator.clipboard.writeText(text).then(() => {
+                showToast("Link copied to clipboard");
+            }).catch(() => {
+                showToast("Could not copy link");
+            });
+        }
 
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% if messages %}
-        {% for category, message in messages %}
-          <div class="flash">{{ message }}</div>
-        {% endfor %}
-      {% endif %}
-    {% endwith %}
+        function showToast(message) {
+            const toast = document.createElement("div");
+            toast.className = "flash info";
+            toast.style.position = "fixed";
+            toast.style.right = "18px";
+            toast.style.bottom = "18px";
+            toast.style.zIndex = "9999";
+            toast.style.maxWidth = "320px";
+            toast.textContent = message;
+            document.body.appendChild(toast);
 
-    {{ body|safe }}
+            setTimeout(() => {
+                toast.style.opacity = "0";
+                toast.style.transform = "translateY(8px)";
+                toast.style.transition = "all .25s ease";
+            }, 1800);
+
+            setTimeout(() => toast.remove(), 2200);
+        }
+
+        function lockButton(button, text) {
+            if (!button) return;
+            button.disabled = true;
+            button.classList.add("show-spinner");
+            const txt = button.querySelector(".btn-text");
+            if (txt && text) txt.textContent = text;
+        }
+
+        document.addEventListener("submit", function(e) {
+            const form = e.target;
+            if (form.matches(".loading-form")) {
+                const btn = form.querySelector("button[type='submit']");
+                lockButton(btn, btn.dataset.loadingText || "Please wait");
+            }
+        });
+    </script>
+
+    {{ page_script|safe }}
 </body>
 </html>
 """
 
 
-def render_page(title, body, refresh=None):
+def render_page(title, body, page_script=""):
     return render_template_string(
         BASE_HTML,
         title=title,
         body=body,
-        refresh=refresh,
+        page_script=page_script,
         user=current_user(),
-        device_id=current_device_id(),
-        device_name=default_device_name(),
     )
 
+
+def status_pill(status):
+    if status == "approved":
+        return '<span class="pill pill-success">Approved</span>'
+    if status == "blocked":
+        return '<span class="pill pill-danger">Blocked</span>'
+    if status == "pending":
+        return '<span class="pill pill-warning">Pending</span>'
+    return f'<span class="pill pill-info">{status.title()}</span>'
 
 # =========================================================
 # ROUTES
 # =========================================================
 @app.route("/")
 def home():
-    body = """
-    <div class="card">
-        <h2>ML QR Authentication System</h2>
-        <p>This Flask version does the flow properly.</p>
-        <ul>
-            <li>Register on first device and it becomes trusted</li>
-            <li>Login on a trusted device goes straight in</li>
-            <li>Login on a new device shows a QR verification link</li>
-            <li>Trusted device scans the QR and approves the login</li>
-            <li>Approved device becomes trusted too</li>
-            <li>Simple ML risk scoring is included</li>
-        </ul>
+    body = f"""
+    <section class="hero">
+        <div class="hero-card">
+            <div class="eyebrow">Secure QR verification • Trusted devices • ML risk engine</div>
+            <h2>Authentication that looks like a real product now.</h2>
+            <p>
+                QR Shield combines username-password login, trusted device linking, QR-based approval,
+                and a lightweight machine learning risk model to evaluate suspicious login attempts.
+                Finally, your app no longer looks like a classroom sacrifice.
+            </p>
+            <div class="hero-actions">
+                <a class="btn btn-primary" href="{url_for('register')}">Create Account</a>
+                <a class="btn btn-ghost" href="{url_for('login')}">Sign In</a>
+            </div>
+        </div>
+
+        <div class="hero-card">
+            <div class="mini-grid">
+                <div class="stat">
+                    <div class="label">Current Device</div>
+                    <div class="value">{default_device_name()}</div>
+                </div>
+                <div class="stat">
+                    <div class="label">Device ID</div>
+                    <div class="value">{current_device_id()}</div>
+                </div>
+                <div class="stat">
+                    <div class="label">Trusted Flow</div>
+                    <div class="value">Password + QR Approval</div>
+                </div>
+                <div class="stat">
+                    <div class="label">Risk Engine</div>
+                    <div class="value">Low / Medium / High</div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <div class="content-grid">
+        <div class="card">
+            <h3>How it works</h3>
+            <div class="mini-grid">
+                <div class="stat">
+                    <div class="label">1. Sign In</div>
+                    <div class="value">Trusted devices log in directly</div>
+                </div>
+                <div class="stat">
+                    <div class="label">2. New Device</div>
+                    <div class="value">QR approval request is generated</div>
+                </div>
+                <div class="stat">
+                    <div class="label">3. Scan QR</div>
+                    <div class="value">Trusted device opens approval page</div>
+                </div>
+                <div class="stat">
+                    <div class="label">4. ML Check</div>
+                    <div class="value">Risk score informs the approval decision</div>
+                </div>
+            </div>
+        </div>
     </div>
     """
     return render_page("Home", body)
@@ -531,31 +1139,43 @@ def register():
         device_name = request.form.get("device_name", "").strip() or default_device_name()
 
         if not username or not password:
-            flash("Fill in all fields.")
+            flash("Please fill in all fields.", "warning")
             return redirect(url_for("register"))
 
         if user_exists(username):
-            flash("Username already exists.")
+            flash("That username already exists.", "error")
             return redirect(url_for("register"))
 
         create_user(username, password)
         add_trusted_device(username, current_device_id(), device_name)
         session["user"] = username
-        flash("Account created. This device is now the first trusted device.")
+        flash("Account created successfully. This device is now trusted.", "success")
         return redirect(url_for("dashboard"))
 
     body = f"""
-    <div class="card">
-        <h2>Register</h2>
-        <form method="post">
-            <label>Username</label>
-            <input name="username" type="text" required>
-            <label>Password</label>
-            <input name="password" type="password" required>
-            <label>Device Name</label>
-            <input name="device_name" type="text" value="{default_device_name()}">
-            <button type="submit">Create Account</button>
-        </form>
+    <div class="auth-wrap">
+        <div class="card auth-card">
+            <h2>Create Account</h2>
+            <p class="subtle">Register once and this device becomes your first trusted device.</p>
+            <form method="post" class="form-grid loading-form">
+                <div>
+                    <label>Username</label>
+                    <input name="username" type="text" placeholder="Choose a username" required>
+                </div>
+                <div>
+                    <label>Password</label>
+                    <input name="password" type="password" placeholder="Enter a secure password" required>
+                </div>
+                <div>
+                    <label>Device Name</label>
+                    <input name="device_name" type="text" value="{default_device_name()}">
+                </div>
+                <button class="btn btn-primary" type="submit" data-loading-text="Creating account">
+                    <span class="spinner"></span>
+                    <span class="btn-text">Create Account</span>
+                </button>
+            </form>
+        </div>
     </div>
     """
     return render_page("Register", body)
@@ -573,12 +1193,12 @@ def login():
         next_url = request.form.get("next", "").strip()
 
         if not username or not password:
-            flash("Fill in all fields.")
+            flash("Please fill in all fields.", "warning")
             return redirect(url_for("login", next=next_url))
 
         if not verify_user(username, password):
             session["failed_attempts"] = failed_attempts + 1
-            flash("Invalid username or password.")
+            flash("Invalid username or password.", "error")
             return redirect(url_for("login", next=next_url))
 
         session["failed_attempts"] = 0
@@ -586,29 +1206,43 @@ def login():
         if is_trusted_device(username, current_device_id()):
             session["user"] = username
             add_trusted_device(username, current_device_id(), device_name)
-            flash("Login successful on trusted device.")
+            flash("Login successful on trusted device.", "success")
             return redirect(next_url or url_for("dashboard"))
 
         token = create_login_request(username, current_device_id())
         session["pending_login_token"] = token
         session["pending_login_user"] = username
         session["pending_login_device_name"] = device_name
+        flash("New device detected. QR verification is required.", "info")
         return redirect(url_for("pending_login", token=token))
 
     body = f"""
-    <div class="card">
-        <h2>Login</h2>
-        <form method="post">
-            <input type="hidden" name="next" value="{next_url}">
-            <label>Username</label>
-            <input name="username" type="text" required>
-            <label>Password</label>
-            <input name="password" type="password" required>
-            <label>Current Device Name</label>
-            <input name="device_name" type="text" value="{default_device_name()}">
-            <button type="submit">Login</button>
-        </form>
-        <p class="muted">If this device is not trusted, a QR code will be generated for approval.</p>
+    <div class="auth-wrap">
+        <div class="card auth-card">
+            <h2>Welcome back</h2>
+            <p class="subtle">
+                Sign in normally on trusted devices. New devices will require QR approval.
+            </p>
+            <form method="post" class="form-grid loading-form">
+                <input type="hidden" name="next" value="{next_url}">
+                <div>
+                    <label>Username</label>
+                    <input name="username" type="text" placeholder="Enter your username" required>
+                </div>
+                <div>
+                    <label>Password</label>
+                    <input name="password" type="password" placeholder="Enter your password" required>
+                </div>
+                <div>
+                    <label>Current Device Name</label>
+                    <input name="device_name" type="text" value="{default_device_name()}">
+                </div>
+                <button class="btn btn-primary" type="submit" data-loading-text="Signing in">
+                    <span class="spinner"></span>
+                    <span class="btn-text">Sign In</span>
+                </button>
+            </form>
+        </div>
     </div>
     """
     return render_page("Login", body)
@@ -619,56 +1253,124 @@ def pending_login(token):
     row = get_login_request(token)
     if not row:
         return render_page("Pending Login", """
-        <div class="card"><h2>Pending Login</h2><p class="error">Login request not found.</p></div>
+        <div class="card"><h2>Pending Login</h2><div class="empty">Login request not found.</div></div>
         """)
 
     if session.get("pending_login_token") != token:
-        flash("This browser is not the original waiting device for that login request.")
+        flash("This browser is not the original waiting device for that request.", "error")
         return redirect(url_for("login"))
-
-    status = row["status"]
-    username = row["username"]
-
-    if status == "approved":
-        session["user"] = username
-        add_trusted_device(
-            username,
-            current_device_id(),
-            session.get("pending_login_device_name", default_device_name())
-        )
-        session.pop("pending_login_token", None)
-        session.pop("pending_login_user", None)
-        session.pop("pending_login_device_name", None)
-        flash("Login approved. This device is now trusted.")
-        return redirect(url_for("dashboard"))
-
-    if status == "blocked":
-        session.pop("pending_login_token", None)
-        session.pop("pending_login_user", None)
-        session.pop("pending_login_device_name", None)
-        return render_page("Pending Login", """
-        <div class="card">
-            <h2>Pending Login</h2>
-            <p class="error">This login request was blocked.</p>
-            <a class="button" href="/login">Back to Login</a>
-        </div>
-        """)
 
     approve_url = url_for("approve_qr", token=token, _external=True)
     qr_b64 = qr_image_data(approve_url)
 
     body = f"""
-    <div class="card">
-        <h2>QR Verification Needed</h2>
-        <p>This device is not trusted yet. Scan this QR code with a trusted device.</p>
-        <img src="data:image/png;base64,{qr_b64}" alt="QR Code">
-        <p class="muted">If your camera opens a new tab and asks you to log in, that's fine. After login it will return to the approval page automatically. Miracles do happen.</p>
-        <p><strong>Approval Link:</strong><br><code>{approve_url}</code></p>
-        <p><strong>Status:</strong> pending</p>
-        <p class="muted">This page refreshes automatically every 5 seconds.</p>
+    <div class="two-col" style="margin-top:20px;">
+        <div class="card">
+            <div id="statusBanner" class="status-banner pending">Status: Pending approval</div>
+            <h2>QR Verification Needed</h2>
+            <p class="subtle">
+                This device is not trusted yet. Scan the QR code with a trusted device to continue.
+                If the camera opens a new tab, log in there and it will return to the approval page.
+                Technology sometimes behaves, against all odds.
+            </p>
+
+            <div class="link-box">
+                <strong>Approval Link</strong><br>
+                <span id="approvalLink">{approve_url}</span>
+            </div>
+
+            <div class="copy-row">
+                <button class="btn btn-primary" type="button" onclick="copyToClipboard(document.getElementById('approvalLink').textContent)">
+                    Copy Link
+                </button>
+                <a class="btn btn-ghost" href="{approve_url}" target="_blank" rel="noopener">Open Approval Page</a>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="qr-box">
+                <img src="data:image/png;base64,{qr_b64}" alt="QR Code">
+            </div>
+        </div>
+    </div>
+
+    <div class="content-grid">
+        <div class="card">
+            <h3>Live Request Status</h3>
+            <div class="mini-grid">
+                <div class="stat">
+                    <div class="label">Request Token</div>
+                    <div class="value">{token}</div>
+                </div>
+                <div class="stat">
+                    <div class="label">Username</div>
+                    <div class="value">{row["username"]}</div>
+                </div>
+            </div>
+            <p class="subtle" id="statusText">Waiting for approval...</p>
+        </div>
     </div>
     """
-    return render_page("Pending Login", body, refresh=5)
+
+    page_script = f"""
+    <script>
+        const token = "{token}";
+        let pollInterval = null;
+
+        function updateStatusUI(status) {{
+            const banner = document.getElementById("statusBanner");
+            const text = document.getElementById("statusText");
+
+            banner.className = "status-banner " + status;
+
+            if (status === "pending") {{
+                banner.textContent = "Status: Pending approval";
+                text.textContent = "Waiting for approval from a trusted device...";
+            }} else if (status === "approved") {{
+                banner.textContent = "Status: Approved";
+                text.textContent = "Approval received. Redirecting to dashboard...";
+            }} else if (status === "blocked") {{
+                banner.textContent = "Status: Blocked";
+                text.textContent = "This login request was blocked.";
+            }}
+        }}
+
+        async function pollStatus() {{
+            try {{
+                const res = await fetch("/status/" + token, {{ cache: "no-store" }});
+                const data = await res.json();
+                updateStatusUI(data.status);
+
+                if (data.status === "approved") {{
+                    clearInterval(pollInterval);
+                    setTimeout(() => window.location.reload(), 900);
+                }}
+
+                if (data.status === "blocked") {{
+                    clearInterval(pollInterval);
+                    setTimeout(() => window.location.reload(), 1200);
+                }}
+            }} catch (err) {{
+                console.error("Polling failed", err);
+            }}
+        }}
+
+        pollStatus();
+        pollInterval = setInterval(pollStatus, 3000);
+    </script>
+    """
+    return render_page("Pending Login", body, page_script=page_script)
+
+
+@app.route("/status/<token>")
+def request_status(token):
+    row = get_login_request(token)
+    if not row:
+        return jsonify({"status": "missing"}), 404
+    return jsonify({
+        "status": row["status"],
+        "risk_result": row["risk_result"] or ""
+    })
 
 
 @app.route("/approve/<token>", methods=["GET", "POST"])
@@ -676,7 +1378,10 @@ def approve_qr(token):
     row = get_login_request(token)
     if not row:
         return render_page("Approve QR", """
-        <div class="card"><h2>Approve Login</h2><p class="error">Invalid or missing approval request.</p></div>
+        <div class="card" style="margin-top:20px;">
+            <h2>Approve Login</h2>
+            <div class="empty">Invalid or missing approval request.</div>
+        </div>
         """)
 
     username = row["username"]
@@ -687,18 +1392,24 @@ def approve_qr(token):
 
     if current_user() != username:
         return render_page("Approve QR", f"""
-        <div class="card">
+        <div class="card" style="margin-top:20px;">
             <h2>Approve Login</h2>
-            <p class="error">You are logged in as <strong>{current_user()}</strong>, but this request belongs to <strong>{username}</strong>.</p>
-            <p>Log into the correct trusted account to approve it. Humans do love making account mix-ups.</p>
+            <div class="status-banner blocked">
+                You are logged in as {current_user()}, but this request belongs to {username}.
+            </div>
+            <p class="subtle">
+                Use the correct trusted account to approve this login. Humans and account mix-ups remain an exhausting duo.
+            </p>
         </div>
         """)
 
     if not is_trusted_device(username, current_device_id()):
         return render_page("Approve QR", """
-        <div class="card">
+        <div class="card" style="margin-top:20px;">
             <h2>Approve Login</h2>
-            <p class="error">This device is not trusted for this account, so it cannot approve the login.</p>
+            <div class="status-banner blocked">
+                This device is not trusted for this account and cannot approve the login.
+            </div>
         </div>
         """)
 
@@ -721,14 +1432,14 @@ def approve_qr(token):
 
         if action == "approve":
             if risk_label == "High Risk":
-                flash("High-risk request. Approval was not allowed automatically.")
+                flash("High-risk request detected. Automatic approval is disabled.", "warning")
             else:
                 update_login_request_status(token, "approved", risk_label)
                 save_login_log(
                     username, login_hour, failed_attempts,
                     new_device, distance_km, trusted_device, risk_label
                 )
-                flash("Login approved. The waiting device can now sign in.")
+                flash("Login approved successfully.", "success")
                 return redirect(url_for("approve_qr", token=token))
 
         elif action == "block":
@@ -737,61 +1448,119 @@ def approve_qr(token):
                 username, login_hour, failed_attempts,
                 new_device, distance_km, trusted_device, "Blocked"
             )
-            flash("Login blocked.")
+            flash("Login request blocked.", "error")
             return redirect(url_for("approve_qr", token=token))
 
-    status_block = f"""
-    <p><strong>Username:</strong> {username}</p>
-    <p><strong>Status:</strong> {status}</p>
-    <p class="muted"><strong>Created:</strong> {row["created_at"]}</p>
-    """
-
-    risk_block = f"""
-    <div class="card">
-        <h3>Machine Learning Risk Analysis</h3>
-        <p><strong>Login Hour:</strong> {login_hour}</p>
-        <p><strong>Failed Attempts:</strong> {failed_attempts}</p>
-        <p><strong>New Device:</strong> Yes</p>
-        <p><strong>Distance (km):</strong> {distance_km:.2f}</p>
-        <p><strong>Trusted Approver Device:</strong> Yes</p>
-        <p><strong>Prediction:</strong> {risk_label}</p>
-        <p class="muted">
-            Low: {float(proba[0]):.4f} |
-            Medium: {float(proba[1]):.4f} |
-            High: {float(proba[2]):.4f}
-        </p>
-    </div>
-    """
-
-    buttons = ""
-    if status == "pending":
-        if risk_label == "High Risk":
-            buttons = """
-            <p class="warn">High-risk login detected. You can block it below.</p>
-            <form method="post">
-                <button type="submit" name="action" value="block">Block Login</button>
-            </form>
-            """
-        else:
-            buttons = """
-            <form method="post">
-                <button type="submit" name="action" value="approve">Approve Login</button>
-                <button type="submit" name="action" value="block">Block Login</button>
-            </form>
-            """
+    if status == "approved":
+        status_html = '<div class="status-banner approved">This login request has already been approved.</div>'
+    elif status == "blocked":
+        status_html = '<div class="status-banner blocked">This login request has been blocked.</div>'
     else:
-        buttons = f'<p><strong>Final Status:</strong> {status}</p>'
+        status_html = '<div class="status-banner pending">This login request is waiting for your decision.</div>'
 
     body = f"""
-    <div class="card">
-        <h2>Approve Login Request</h2>
-        {status_block}
-    </div>
-    {risk_block}
-    <div class="card">
-        {buttons}
-    </div>
+    <div class="content-grid" style="margin-top:20px;">
+        <div class="card">
+            {status_html}
+            <h2>Approve Login Request</h2>
+            <div class="mini-grid">
+                <div class="stat">
+                    <div class="label">Username</div>
+                    <div class="value">{username}</div>
+                </div>
+                <div class="stat">
+                    <div class="label">Created At</div>
+                    <div class="value">{row["created_at"]}</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="card">
+            <h3>Machine Learning Risk Analysis</h3>
+            <div class="mini-grid" style="margin-bottom:14px;">
+                <div class="stat">
+                    <div class="label">Login Hour</div>
+                    <div class="value">{login_hour}</div>
+                </div>
+                <div class="stat">
+                    <div class="label">Distance</div>
+                    <div class="value">{distance_km:.2f} km</div>
+                </div>
+                <div class="stat">
+                    <div class="label">Failed Attempts</div>
+                    <div class="value">{failed_attempts}</div>
+                </div>
+                <div class="stat">
+                    <div class="label">New Device</div>
+                    <div class="value">Yes</div>
+                </div>
+            </div>
+
+            <div class="status-banner {'approved' if risk_label == 'Low Risk' else 'pending' if risk_label == 'Medium Risk' else 'blocked'}">
+                Predicted Risk: {risk_label}
+            </div>
+
+            <div class="risk-grid">
+                <div class="risk-card">
+                    <div class="name">Low Risk</div>
+                    <div class="num">{float(proba[0]):.4f}</div>
+                </div>
+                <div class="risk-card">
+                    <div class="name">Medium Risk</div>
+                    <div class="num">{float(proba[1]):.4f}</div>
+                </div>
+                <div class="risk-card">
+                    <div class="name">High Risk</div>
+                    <div class="num">{float(proba[2]):.4f}</div>
+                </div>
+            </div>
+        </div>
     """
+
+    if status == "pending":
+        if risk_label == "High Risk":
+            body += """
+            <div class="card">
+                <h3>Decision</h3>
+                <p class="subtle">This request is marked high risk. Blocking is strongly recommended.</p>
+                <form method="post" class="loading-form">
+                    <button class="btn btn-danger" type="submit" name="action" value="block" data-loading-text="Blocking request">
+                        <span class="spinner"></span>
+                        <span class="btn-text">Block Login</span>
+                    </button>
+                </form>
+            </div>
+            """
+        else:
+            body += """
+            <div class="card">
+                <h3>Decision</h3>
+                <p class="subtle">Approve if this login is genuinely yours. Otherwise block it.</p>
+                <div style="display:flex; gap:12px; flex-wrap:wrap;">
+                    <form method="post" class="loading-form" style="margin:0;">
+                        <button class="btn btn-success" type="submit" name="action" value="approve" data-loading-text="Approving login">
+                            <span class="spinner"></span>
+                            <span class="btn-text">Approve Login</span>
+                        </button>
+                    </form>
+                    <form method="post" class="loading-form" style="margin:0;">
+                        <button class="btn btn-danger" type="submit" name="action" value="block" data-loading-text="Blocking login">
+                            <span class="spinner"></span>
+                            <span class="btn-text">Block Login</span>
+                        </button>
+                    </form>
+                </div>
+            </div>
+            """
+    else:
+        body += f"""
+        <div class="card">
+            <h3>Final Status</h3>
+            <p>{status_pill(status)} {row["risk_result"] or ""}</p>
+        </div>
+        """
+
+    body += "</div>"
     return render_page("Approve QR", body)
 
 
@@ -802,18 +1571,22 @@ def dashboard():
     devices = get_user_devices(username)
     requests_ = get_recent_login_requests(username)
 
+    trusted_count = sum(1 for d in devices if d["trusted"] == 1)
+    pending_count = sum(1 for r in requests_ if r["status"] == "pending")
+
     device_rows = ""
     for d in devices:
-        current_tag = " (Current Device)" if d["device_id"] == current_device_id() else ""
+        current_tag = " <span class='pill pill-info'>Current</span>" if d["device_id"] == current_device_id() else ""
         unlink = ""
         if d["device_id"] != current_device_id():
-            unlink = f'<a class="button" href="{url_for("unlink_device", device_id=d["device_id"])}">Unlink</a>'
+            unlink = f'<a class="btn btn-ghost" href="{url_for("unlink_device", device_id=d["device_id"])}" style="padding:9px 12px; font-size:12px;">Unlink</a>'
+
         device_rows += f"""
         <tr>
             <td>{d["device_name"] or "Unnamed Device"}{current_tag}</td>
             <td>{"Yes" if d["trusted"] else "No"}</td>
             <td>{d["created_at"]}</td>
-            <td>{unlink}</td>
+            <td>{unlink or "-"}</td>
         </tr>
         """
 
@@ -822,46 +1595,72 @@ def dashboard():
         request_rows += f"""
         <tr>
             <td>{r["request_token"]}</td>
-            <td>{r["status"]}</td>
+            <td>{status_pill(r["status"])}</td>
             <td>{r["risk_result"] or "-"}</td>
             <td>{r["created_at"]}</td>
         </tr>
         """
 
     body = f"""
-    <div class="card">
-        <h2>Dashboard</h2>
-        <p>Welcome, <strong>{username}</strong>.</p>
-    </div>
+    <section class="hero" style="margin-top:20px;">
+        <div class="hero-card">
+            <div class="eyebrow">Dashboard</div>
+            <h2>Welcome back, {username}</h2>
+            <p>Manage trusted devices, review login requests, and keep an eye on authentication activity without the page looking like a sad spreadsheet.</p>
+        </div>
 
-    <div class="card">
-        <h3>Trusted Devices</h3>
-        <table>
-            <tr>
-                <th>Device Name</th>
-                <th>Trusted</th>
-                <th>Added</th>
-                <th>Action</th>
-            </tr>
-            {device_rows if device_rows else '<tr><td colspan="4">No linked devices.</td></tr>'}
-        </table>
-    </div>
+        <div class="hero-card">
+            <div class="mini-grid">
+                <div class="stat">
+                    <div class="label">Trusted Devices</div>
+                    <div class="value">{trusted_count}</div>
+                </div>
+                <div class="stat">
+                    <div class="label">Pending Requests</div>
+                    <div class="value">{pending_count}</div>
+                </div>
+                <div class="stat">
+                    <div class="label">Current Device</div>
+                    <div class="value">{default_device_name()}</div>
+                </div>
+                <div class="stat">
+                    <div class="label">Device ID</div>
+                    <div class="value">{current_device_id()}</div>
+                </div>
+            </div>
+        </div>
+    </section>
 
-    <div class="card">
-        <h3>Recent Login Requests</h3>
-        <table>
-            <tr>
-                <th>Token</th>
-                <th>Status</th>
-                <th>Risk</th>
-                <th>Created</th>
-            </tr>
-            {request_rows if request_rows else '<tr><td colspan="4">No login requests yet.</td></tr>'}
-        </table>
-    </div>
+    <div class="content-grid">
+        <div class="card">
+            <h3>Trusted Devices</h3>
+            <div class="table-wrap">
+                <table>
+                    <tr>
+                        <th>Device Name</th>
+                        <th>Trusted</th>
+                        <th>Added</th>
+                        <th>Action</th>
+                    </tr>
+                    {device_rows if device_rows else '<tr><td colspan="4">No linked devices found.</td></tr>'}
+                </table>
+            </div>
+        </div>
 
-    <div class="card">
-        <p><a class="button" href="{url_for('admin_logs')}">View Authentication Logs</a></p>
+        <div class="card">
+            <h3>Recent Login Requests</h3>
+            <div class="table-wrap">
+                <table>
+                    <tr>
+                        <th>Token</th>
+                        <th>Status</th>
+                        <th>Risk</th>
+                        <th>Created</th>
+                    </tr>
+                    {request_rows if request_rows else '<tr><td colspan="4">No login requests yet.</td></tr>'}
+                </table>
+            </div>
+        </div>
     </div>
     """
     return render_page("Dashboard", body)
@@ -871,11 +1670,11 @@ def dashboard():
 @login_required
 def unlink_device(device_id):
     if device_id == current_device_id():
-        flash("You cannot unlink the device you are currently using.")
+        flash("You cannot unlink the device you are currently using.", "warning")
         return redirect(url_for("dashboard"))
 
     remove_device(current_user(), device_id)
-    flash("Device unlinked.")
+    flash("Device unlinked successfully.", "success")
     return redirect(url_for("dashboard"))
 
 
@@ -900,21 +1699,26 @@ def admin_logs():
         """
 
     body = f"""
-    <div class="card">
-        <h2>Authentication Logs</h2>
-        <table>
-            <tr>
-                <th>User</th>
-                <th>Hour</th>
-                <th>Failed Attempts</th>
-                <th>New Device</th>
-                <th>Distance</th>
-                <th>Trusted Device</th>
-                <th>Risk Result</th>
-                <th>Timestamp</th>
-            </tr>
-            {html_rows if html_rows else '<tr><td colspan="8">No logs yet.</td></tr>'}
-        </table>
+    <div class="content-grid" style="margin-top:20px;">
+        <div class="card">
+            <h2>Authentication Logs</h2>
+            <p class="subtle">A record of recent authentication outcomes, because systems without logs are just vibes and denial.</p>
+            <div class="table-wrap">
+                <table>
+                    <tr>
+                        <th>User</th>
+                        <th>Hour</th>
+                        <th>Failed Attempts</th>
+                        <th>New Device</th>
+                        <th>Distance</th>
+                        <th>Trusted Device</th>
+                        <th>Risk Result</th>
+                        <th>Timestamp</th>
+                    </tr>
+                    {html_rows if html_rows else '<tr><td colspan="8">No logs yet.</td></tr>'}
+                </table>
+            </div>
+        </div>
     </div>
     """
     return render_page("Logs", body)
@@ -923,12 +1727,12 @@ def admin_logs():
 @app.route("/logout")
 def logout():
     session.clear()
-    flash("Logged out.")
+    flash("Logged out successfully.", "info")
     return redirect(url_for("login"))
-
 
 # =========================================================
 # RUN
 # =========================================================
 if __name__ == "__main__":
-    app.run(debug=True)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
