@@ -1,281 +1,119 @@
-import streamlit as st
-import sqlite3
-import hashlib
+import os
+import io
+import base64
 import uuid
-import qrcode
-from io import BytesIO
-from datetime import datetime
+import sqlite3
 import random
-import pandas as pd
-import extra_streamlit_components as stx
+from datetime import datetime
+from functools import wraps
 
+import pandas as pd
+import qrcode
+from flask import (
+    Flask, request, redirect, url_for, session, g,
+    make_response, render_template_string, flash
+)
+from werkzeug.security import generate_password_hash, check_password_hash
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 
 # =========================================================
 # CONFIG
 # =========================================================
-st.set_page_config(page_title="ML QR Authentication", layout="wide")
-
-# Replace with your actual deployed Streamlit URL
-APP_URL ="https://qr-aapoly.streamlit.app"
-
-DB_NAME = "auth_ml_v3.db"
-
-cookie_manager = stx.CookieManager()
+app = Flask(__name__)
+app.secret_key = os.environ.get("SECRET_KEY", "change-this-secret-key-now")
+DB_NAME = os.environ.get("DB_NAME", "auth_flask.db")
 
 
 # =========================================================
 # DATABASE
 # =========================================================
-conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-c = conn.cursor()
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(DB_NAME)
+        g.db.row_factory = sqlite3.Row
+    return g.db
 
-c.execute("""
-CREATE TABLE IF NOT EXISTS users(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password TEXT NOT NULL,
-    created_at TEXT
-)
-""")
 
-c.execute("""
-CREATE TABLE IF NOT EXISTS devices(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL,
-    device_hash TEXT NOT NULL,
-    device_name TEXT,
-    trusted INTEGER DEFAULT 1,
-    created_at TEXT
-)
-""")
-
-c.execute("""
-CREATE TABLE IF NOT EXISTS login_requests(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    request_token TEXT UNIQUE NOT NULL,
-    username TEXT NOT NULL,
-    requester_device_hash TEXT NOT NULL,
-    status TEXT NOT NULL,
-    created_at TEXT
-)
-""")
-
-c.execute("""
-CREATE TABLE IF NOT EXISTS login_logs(
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT,
-    login_hour INTEGER,
-    failed_attempts INTEGER,
-    new_device INTEGER,
-    distance_km REAL,
-    trusted_device INTEGER,
-    risk_result TEXT,
-    timestamp TEXT
-)
-""")
-
-conn.commit()
+@app.teardown_appcontext
+def close_db(exception=None):
+    db = g.pop("db", None)
+    if db is not None:
+        db.close()
 
 
 def ensure_column(table_name, column_name, column_def):
-    c.execute(f"PRAGMA table_info({table_name})")
-    columns = [row[1] for row in c.fetchall()]
+    db = get_db()
+    cur = db.execute(f"PRAGMA table_info({table_name})")
+    columns = [row["name"] for row in cur.fetchall()]
     if column_name not in columns:
-        c.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
-        conn.commit()
+        db.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+        db.commit()
 
 
-ensure_column("users", "created_at", "TEXT")
-ensure_column("devices", "created_at", "TEXT")
+def init_db():
+    db = get_db()
 
-
-# =========================================================
-# HELPERS
-# =========================================================
-def now_str():
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def hash_text(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()
-
-
-def get_cookies():
-    try:
-        return cookie_manager.get_all()
-    except Exception:
-        return {}
-
-
-def get_or_create_device_id():
-    cookies = get_cookies()
-    device_id = cookies.get("device_id")
-
-    if not device_id:
-        device_id = str(uuid.uuid4())
-        cookie_manager.set("device_id", device_id, key="set_device_id_cookie")
-
-    return device_id
-
-
-def get_device_hash() -> str:
-    return hash_text(get_or_create_device_id())
-
-
-def default_device_name() -> str:
-    cookies = get_cookies()
-    saved_name = cookies.get("device_name")
-
-    if not saved_name:
-        saved_name = f"Device-{str(uuid.uuid4())[:8]}"
-        cookie_manager.set("device_name", saved_name, key="set_device_name_cookie")
-
-    return saved_name
-
-
-def user_exists(username: str) -> bool:
-    c.execute("SELECT id FROM users WHERE username=?", (username,))
-    return c.fetchone() is not None
-
-
-def register_user(username: str, password: str) -> bool:
-    try:
-        c.execute(
-            "INSERT INTO users(username, password, created_at) VALUES (?, ?, ?)",
-            (username, hash_text(password), now_str())
-        )
-        conn.commit()
-        return True
-    except Exception as e:
-        st.error(f"Registration DB error: {e}")
-        return False
-
-
-def verify_user(username: str, password: str) -> bool:
-    c.execute(
-        "SELECT id FROM users WHERE username=? AND password=?",
-        (username, hash_text(password))
+    db.execute("""
+    CREATE TABLE IF NOT EXISTS users(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        created_at TEXT
     )
-    return c.fetchone() is not None
-
-
-def add_trusted_device(username: str, device_hash: str, device_name: str) -> None:
-    c.execute(
-        "SELECT id FROM devices WHERE username=? AND device_hash=?",
-        (username, device_hash)
-    )
-    existing = c.fetchone()
-
-    if existing is None:
-        c.execute("""
-            INSERT INTO devices(username, device_hash, device_name, trusted, created_at)
-            VALUES (?, ?, ?, 1, ?)
-        """, (username, device_hash, device_name, now_str()))
-        conn.commit()
-    else:
-        c.execute("""
-            UPDATE devices
-            SET trusted=1, device_name=?
-            WHERE username=? AND device_hash=?
-        """, (device_name, username, device_hash))
-        conn.commit()
-
-
-def is_trusted_device(username: str, device_hash: str) -> bool:
-    c.execute("""
-        SELECT id FROM devices
-        WHERE username=? AND device_hash=? AND trusted=1
-    """, (username, device_hash))
-    return c.fetchone() is not None
-
-
-def get_user_devices(username: str):
-    c.execute("""
-        SELECT device_hash, device_name, trusted, created_at
-        FROM devices
-        WHERE username=?
-        ORDER BY id DESC
-    """, (username,))
-    return c.fetchall()
-
-
-def remove_device(username: str, device_hash: str) -> None:
-    c.execute("""
-        DELETE FROM devices
-        WHERE username=? AND device_hash=?
-    """, (username, device_hash))
-    conn.commit()
-
-
-def create_login_request(username: str, requester_device_hash: str) -> str:
-    token = str(uuid.uuid4())
-    c.execute("""
-        INSERT INTO login_requests(request_token, username, requester_device_hash, status, created_at)
-        VALUES (?, ?, ?, ?, ?)
-    """, (token, username, requester_device_hash, "pending", now_str()))
-    conn.commit()
-    return token
-
-
-def get_login_request(token: str):
-    c.execute("""
-        SELECT id, request_token, username, requester_device_hash, status, created_at
-        FROM login_requests
-        WHERE request_token=?
-    """, (token,))
-    return c.fetchone()
-
-
-def update_login_request_status(token: str, status: str) -> None:
-    c.execute("""
-        UPDATE login_requests
-        SET status=?
-        WHERE request_token=?
-    """, (status, token))
-    conn.commit()
-
-
-def get_recent_login_requests(username: str):
-    c.execute("""
-        SELECT request_token, status, created_at
-        FROM login_requests
-        WHERE username=?
-        ORDER BY id DESC
-        LIMIT 10
-    """, (username,))
-    return c.fetchall()
-
-
-def save_login_log(username, login_hour, failed_attempts, new_device, distance_km, trusted_device, risk_result):
-    c.execute("""
-        INSERT INTO login_logs(
-            username, login_hour, failed_attempts, new_device,
-            distance_km, trusted_device, risk_result, timestamp
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        username, login_hour, failed_attempts, new_device,
-        distance_km, trusted_device, risk_result, now_str()
-    ))
-    conn.commit()
-
-
-def get_logs():
-    c.execute("""
-        SELECT username, login_hour, failed_attempts, new_device,
-               distance_km, trusted_device, risk_result, timestamp
-        FROM login_logs
-        ORDER BY id DESC
     """)
-    return c.fetchall()
+
+    db.execute("""
+    CREATE TABLE IF NOT EXISTS devices(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT NOT NULL,
+        device_id TEXT NOT NULL,
+        device_name TEXT,
+        trusted INTEGER DEFAULT 1,
+        created_at TEXT
+    )
+    """)
+
+    db.execute("""
+    CREATE TABLE IF NOT EXISTS login_requests(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        request_token TEXT UNIQUE NOT NULL,
+        username TEXT NOT NULL,
+        requester_device_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        risk_result TEXT,
+        created_at TEXT
+    )
+    """)
+
+    db.execute("""
+    CREATE TABLE IF NOT EXISTS login_logs(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        username TEXT,
+        login_hour INTEGER,
+        failed_attempts INTEGER,
+        new_device INTEGER,
+        distance_km REAL,
+        trusted_device INTEGER,
+        risk_result TEXT,
+        timestamp TEXT
+    )
+    """)
+
+    db.commit()
+
+    ensure_column("users", "created_at", "TEXT")
+    ensure_column("devices", "created_at", "TEXT")
+    ensure_column("login_requests", "risk_result", "TEXT")
+
+
+with app.app_context():
+    init_db()
 
 
 # =========================================================
 # MACHINE LEARNING
 # =========================================================
-@st.cache_resource
 def train_model():
     data = []
     labels = []
@@ -315,16 +153,14 @@ def train_model():
     )
     y = labels
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42
-    )
+    X_train, _, y_train, _ = train_test_split(X, y, test_size=0.2, random_state=42)
 
     model = RandomForestClassifier(n_estimators=120, random_state=42)
     model.fit(X_train, y_train)
     return model
 
 
-model = train_model()
+ML_MODEL = train_model()
 
 
 def predict_risk(login_hour, failed_attempts, new_device, distance_km, trusted_device):
@@ -334,8 +170,8 @@ def predict_risk(login_hour, failed_attempts, new_device, distance_km, trusted_d
         "login_hour", "failed_attempts", "new_device", "distance_km", "trusted_device"
     ])
 
-    pred = model.predict(X)[0]
-    proba = model.predict_proba(X)[0]
+    pred = ML_MODEL.predict(X)[0]
+    proba = ML_MODEL.predict_proba(X)[0]
 
     mapping = {
         0: "Low Risk",
@@ -346,381 +182,753 @@ def predict_risk(login_hour, failed_attempts, new_device, distance_km, trusted_d
 
 
 # =========================================================
-# SESSION + COOKIE RESTORE
+# HELPERS
 # =========================================================
-cookies = get_cookies()
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-if "user" not in st.session_state:
-    st.session_state["user"] = cookies.get("user")
 
-if "failed_attempts" not in st.session_state:
-    st.session_state["failed_attempts"] = 0
+def current_device_id():
+    return getattr(g, "device_id", None)
 
-if "page" not in st.session_state:
-    st.session_state["page"] = "Home"
 
-query_params = st.query_params
+def default_device_name():
+    did = current_device_id() or str(uuid.uuid4())
+    return f"Device-{did[:8]}"
 
-if "approve_token" in query_params:
-    st.session_state["approve_token"] = query_params["approve_token"]
-    st.session_state["page"] = "Approve QR"
+
+def current_user():
+    return session.get("user")
+
+
+def login_required(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        if not current_user():
+            return redirect(url_for("login", next=request.full_path.rstrip("?")))
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+def user_exists(username):
+    db = get_db()
+    row = db.execute("SELECT id FROM users WHERE username=?", (username,)).fetchone()
+    return row is not None
+
+
+def create_user(username, password):
+    db = get_db()
+    db.execute(
+        "INSERT INTO users(username, password, created_at) VALUES (?, ?, ?)",
+        (username, generate_password_hash(password), now_str())
+    )
+    db.commit()
+
+
+def verify_user(username, password):
+    db = get_db()
+    row = db.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+    if not row:
+        return False
+    return check_password_hash(row["password"], password)
+
+
+def add_trusted_device(username, device_id, device_name):
+    db = get_db()
+    existing = db.execute(
+        "SELECT id FROM devices WHERE username=? AND device_id=?",
+        (username, device_id)
+    ).fetchone()
+
+    if existing:
+        db.execute("""
+            UPDATE devices
+            SET trusted=1, device_name=?
+            WHERE username=? AND device_id=?
+        """, (device_name, username, device_id))
+    else:
+        db.execute("""
+            INSERT INTO devices(username, device_id, device_name, trusted, created_at)
+            VALUES (?, ?, ?, 1, ?)
+        """, (username, device_id, device_name, now_str()))
+    db.commit()
+
+
+def is_trusted_device(username, device_id):
+    db = get_db()
+    row = db.execute("""
+        SELECT id FROM devices
+        WHERE username=? AND device_id=? AND trusted=1
+    """, (username, device_id)).fetchone()
+    return row is not None
+
+
+def get_user_devices(username):
+    db = get_db()
+    return db.execute("""
+        SELECT device_id, device_name, trusted, created_at
+        FROM devices
+        WHERE username=?
+        ORDER BY id DESC
+    """, (username,)).fetchall()
+
+
+def remove_device(username, device_id):
+    db = get_db()
+    db.execute("DELETE FROM devices WHERE username=? AND device_id=?", (username, device_id))
+    db.commit()
+
+
+def create_login_request(username, requester_device_id):
+    db = get_db()
+    token = str(uuid.uuid4())
+    db.execute("""
+        INSERT INTO login_requests(request_token, username, requester_device_id, status, risk_result, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (token, username, requester_device_id, "pending", "", now_str()))
+    db.commit()
+    return token
+
+
+def get_login_request(token):
+    db = get_db()
+    return db.execute("""
+        SELECT *
+        FROM login_requests
+        WHERE request_token=?
+    """, (token,)).fetchone()
+
+
+def update_login_request_status(token, status, risk_result=""):
+    db = get_db()
+    db.execute("""
+        UPDATE login_requests
+        SET status=?, risk_result=?
+        WHERE request_token=?
+    """, (status, risk_result, token))
+    db.commit()
+
+
+def get_recent_login_requests(username):
+    db = get_db()
+    return db.execute("""
+        SELECT request_token, status, risk_result, created_at
+        FROM login_requests
+        WHERE username=?
+        ORDER BY id DESC
+        LIMIT 10
+    """, (username,)).fetchall()
+
+
+def save_login_log(username, login_hour, failed_attempts, new_device, distance_km, trusted_device, risk_result):
+    db = get_db()
+    db.execute("""
+        INSERT INTO login_logs(
+            username, login_hour, failed_attempts, new_device,
+            distance_km, trusted_device, risk_result, timestamp
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        username, login_hour, failed_attempts, new_device,
+        distance_km, trusted_device, risk_result, now_str()
+    ))
+    db.commit()
+
+
+def get_logs():
+    db = get_db()
+    return db.execute("""
+        SELECT username, login_hour, failed_attempts, new_device,
+               distance_km, trusted_device, risk_result, timestamp
+        FROM login_logs
+        ORDER BY id DESC
+    """).fetchall()
+
+
+def qr_image_data(url_text):
+    qr = qrcode.QRCode(box_size=8, border=4)
+    qr.add_data(url_text)
+    qr.make(fit=True)
+
+    img = qr.make_image(fill_color="black", back_color="white")
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
 # =========================================================
-# SIDEBAR
+# DEVICE COOKIE
 # =========================================================
-pages = ["Home", "Register", "Login", "Dashboard", "Approve QR", "Admin Logs"]
-
-current_page = st.session_state.get("page", "Home")
-if current_page not in pages:
-    current_page = "Home"
-
-menu = st.sidebar.radio(
-    "Navigation",
-    pages,
-    index=pages.index(current_page)
-)
-
-st.session_state["page"] = menu
-
-st.sidebar.markdown("---")
-st.sidebar.write(f"**Current Device Name:** {default_device_name()}")
-st.sidebar.caption(f"Hash: {get_device_hash()[:20]}...")
+@app.before_request
+def ensure_device():
+    g.new_device_cookie = False
+    device_id = request.cookies.get("device_id")
+    if not device_id:
+        device_id = str(uuid.uuid4())
+        g.new_device_cookie = True
+    g.device_id = device_id
 
 
-# =========================================================
-# HOME
-# =========================================================
-if menu == "Home":
-    st.title("Integration of Machine Learning in QR Code Authentication System")
-    st.write("""
-This system uses:
-
-- **Username and password**
-- **Trusted devices**
-- **QR code approval for new devices**
-- **Machine learning risk analysis**
-- **SQLite database**
-- **Python + Streamlit in one file**
-""")
-
-    st.info("""
-Flow:
-1. User logs in with username and password.
-2. If the device is trusted, login is allowed immediately.
-3. If the device is new, the app generates a QR code.
-4. A trusted device scans the QR code to approve the login.
-5. If the QR opens in a new tab, the trusted device can log in there and return to the approval page automatically.
-6. After approval, the new device is automatically linked as trusted.
-""")
+@app.after_request
+def persist_device_cookie(response):
+    if getattr(g, "new_device_cookie", False):
+        response.set_cookie(
+            "device_id",
+            g.device_id,
+            max_age=60 * 60 * 24 * 365,
+            httponly=True,
+            samesite="Lax"
+        )
+    return response
 
 
 # =========================================================
-# REGISTER
+# TEMPLATES
 # =========================================================
-elif menu == "Register":
-    st.title("Register")
+BASE_HTML = """
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>{{ title }}</title>
+    {% if refresh %}
+    <meta http-equiv="refresh" content="{{ refresh }}">
+    {% endif %}
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 900px;
+            margin: 30px auto;
+            padding: 0 18px;
+            line-height: 1.5;
+            background: #f7f7f8;
+            color: #111;
+        }
+        .card {
+            background: #fff;
+            padding: 18px;
+            border-radius: 14px;
+            margin-bottom: 18px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.06);
+        }
+        input, button {
+            padding: 10px;
+            margin: 6px 0;
+            width: 100%;
+            box-sizing: border-box;
+        }
+        button {
+            cursor: pointer;
+        }
+        a.button {
+            display: inline-block;
+            padding: 10px 14px;
+            background: #111;
+            color: #fff;
+            text-decoration: none;
+            border-radius: 10px;
+        }
+        .muted { color: #666; font-size: 14px; }
+        .success { color: green; }
+        .error { color: #b00020; }
+        .warn { color: #9a6700; }
+        .nav a {
+            margin-right: 10px;
+        }
+        code {
+            word-break: break-all;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            text-align: left;
+            padding: 8px;
+            border-bottom: 1px solid #ddd;
+        }
+        .flash {
+            padding: 10px;
+            border-radius: 10px;
+            background: #eef2ff;
+            margin-bottom: 14px;
+        }
+    </style>
+</head>
+<body>
+    <div class="card nav">
+        <a href="{{ url_for('home') }}">Home</a>
+        {% if user %}
+            <a href="{{ url_for('dashboard') }}">Dashboard</a>
+            <a href="{{ url_for('logout') }}">Logout</a>
+        {% else %}
+            <a href="{{ url_for('register') }}">Register</a>
+            <a href="{{ url_for('login') }}">Login</a>
+        {% endif %}
+    </div>
 
-    username = st.text_input("Username")
-    password = st.text_input("Password", type="password")
-    device_name = st.text_input("Device Name", value=default_device_name())
+    <div class="card">
+        <div><strong>Current device:</strong> {{ device_name }}</div>
+        <div class="muted"><strong>Device ID:</strong> {{ device_id }}</div>
+        {% if user %}
+        <div class="muted"><strong>Logged in as:</strong> {{ user }}</div>
+        {% endif %}
+    </div>
 
-    if st.button("Create Account"):
-        username = username.strip()
-        password = password.strip()
-        device_name = device_name.strip() or default_device_name()
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="flash">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    {{ body|safe }}
+</body>
+</html>
+"""
+
+
+def render_page(title, body, refresh=None):
+    return render_template_string(
+        BASE_HTML,
+        title=title,
+        body=body,
+        refresh=refresh,
+        user=current_user(),
+        device_id=current_device_id(),
+        device_name=default_device_name(),
+    )
+
+
+# =========================================================
+# ROUTES
+# =========================================================
+@app.route("/")
+def home():
+    body = """
+    <div class="card">
+        <h2>ML QR Authentication System</h2>
+        <p>This Flask version does the flow properly.</p>
+        <ul>
+            <li>Register on first device and it becomes trusted</li>
+            <li>Login on a trusted device goes straight in</li>
+            <li>Login on a new device shows a QR verification link</li>
+            <li>Trusted device scans the QR and approves the login</li>
+            <li>Approved device becomes trusted too</li>
+            <li>Simple ML risk scoring is included</li>
+        </ul>
+    </div>
+    """
+    return render_page("Home", body)
+
+
+@app.route("/register", methods=["GET", "POST"])
+def register():
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "").strip()
+        device_name = request.form.get("device_name", "").strip() or default_device_name()
 
         if not username or not password:
-            st.error("Please fill in all fields.")
-        elif user_exists(username):
-            st.error("Username already exists.")
-        else:
-            ok = register_user(username, password)
-            if ok:
-                cookie_manager.set("device_name", device_name, key="register_device_name_cookie")
-                add_trusted_device(username, get_device_hash(), device_name)
-                st.session_state["user"] = username
-                cookie_manager.set("user", username, key="register_user_cookie")
-                st.success("Account created successfully.")
-                st.info("This registration device has been added as the first trusted device.")
-            else:
-                st.error("Registration failed.")
+            flash("Fill in all fields.")
+            return redirect(url_for("register"))
+
+        if user_exists(username):
+            flash("Username already exists.")
+            return redirect(url_for("register"))
+
+        create_user(username, password)
+        add_trusted_device(username, current_device_id(), device_name)
+        session["user"] = username
+        flash("Account created. This device is now the first trusted device.")
+        return redirect(url_for("dashboard"))
+
+    body = f"""
+    <div class="card">
+        <h2>Register</h2>
+        <form method="post">
+            <label>Username</label>
+            <input name="username" type="text" required>
+            <label>Password</label>
+            <input name="password" type="password" required>
+            <label>Device Name</label>
+            <input name="device_name" type="text" value="{default_device_name()}">
+            <button type="submit">Create Account</button>
+        </form>
+    </div>
+    """
+    return render_page("Register", body)
 
 
-# =========================================================
-# LOGIN
-# =========================================================
-elif menu == "Login":
-    st.title("Login")
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    next_url = request.args.get("next", "")
+    failed_attempts = session.get("failed_attempts", 0)
 
-    username = st.text_input("Username")
-    password = st.text_input("Password", type="password")
-    device_name = st.text_input("Current Device Name", value=default_device_name(), key="login_device_name")
-
-    if st.button("Login"):
-        username = username.strip()
-        password = password.strip()
-        device_name = device_name.strip() or default_device_name()
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "").strip()
+        device_name = request.form.get("device_name", "").strip() or default_device_name()
+        next_url = request.form.get("next", "").strip()
 
         if not username or not password:
-            st.error("Please fill in all fields.")
-        elif not verify_user(username, password):
-            st.session_state["failed_attempts"] += 1
-            st.error("Invalid username or password.")
+            flash("Fill in all fields.")
+            return redirect(url_for("login", next=next_url))
+
+        if not verify_user(username, password):
+            session["failed_attempts"] = failed_attempts + 1
+            flash("Invalid username or password.")
+            return redirect(url_for("login", next=next_url))
+
+        session["failed_attempts"] = 0
+
+        if is_trusted_device(username, current_device_id()):
+            session["user"] = username
+            add_trusted_device(username, current_device_id(), device_name)
+            flash("Login successful on trusted device.")
+            return redirect(next_url or url_for("dashboard"))
+
+        token = create_login_request(username, current_device_id())
+        session["pending_login_token"] = token
+        session["pending_login_user"] = username
+        session["pending_login_device_name"] = device_name
+        return redirect(url_for("pending_login", token=token))
+
+    body = f"""
+    <div class="card">
+        <h2>Login</h2>
+        <form method="post">
+            <input type="hidden" name="next" value="{next_url}">
+            <label>Username</label>
+            <input name="username" type="text" required>
+            <label>Password</label>
+            <input name="password" type="password" required>
+            <label>Current Device Name</label>
+            <input name="device_name" type="text" value="{default_device_name()}">
+            <button type="submit">Login</button>
+        </form>
+        <p class="muted">If this device is not trusted, a QR code will be generated for approval.</p>
+    </div>
+    """
+    return render_page("Login", body)
+
+
+@app.route("/pending/<token>")
+def pending_login(token):
+    row = get_login_request(token)
+    if not row:
+        return render_page("Pending Login", """
+        <div class="card"><h2>Pending Login</h2><p class="error">Login request not found.</p></div>
+        """)
+
+    if session.get("pending_login_token") != token:
+        flash("This browser is not the original waiting device for that login request.")
+        return redirect(url_for("login"))
+
+    status = row["status"]
+    username = row["username"]
+
+    if status == "approved":
+        session["user"] = username
+        add_trusted_device(
+            username,
+            current_device_id(),
+            session.get("pending_login_device_name", default_device_name())
+        )
+        session.pop("pending_login_token", None)
+        session.pop("pending_login_user", None)
+        session.pop("pending_login_device_name", None)
+        flash("Login approved. This device is now trusted.")
+        return redirect(url_for("dashboard"))
+
+    if status == "blocked":
+        session.pop("pending_login_token", None)
+        session.pop("pending_login_user", None)
+        session.pop("pending_login_device_name", None)
+        return render_page("Pending Login", """
+        <div class="card">
+            <h2>Pending Login</h2>
+            <p class="error">This login request was blocked.</p>
+            <a class="button" href="/login">Back to Login</a>
+        </div>
+        """)
+
+    approve_url = url_for("approve_qr", token=token, _external=True)
+    qr_b64 = qr_image_data(approve_url)
+
+    body = f"""
+    <div class="card">
+        <h2>QR Verification Needed</h2>
+        <p>This device is not trusted yet. Scan this QR code with a trusted device.</p>
+        <img src="data:image/png;base64,{qr_b64}" alt="QR Code">
+        <p class="muted">If your camera opens a new tab and asks you to log in, that's fine. After login it will return to the approval page automatically. Miracles do happen.</p>
+        <p><strong>Approval Link:</strong><br><code>{approve_url}</code></p>
+        <p><strong>Status:</strong> pending</p>
+        <p class="muted">This page refreshes automatically every 5 seconds.</p>
+    </div>
+    """
+    return render_page("Pending Login", body, refresh=5)
+
+
+@app.route("/approve/<token>", methods=["GET", "POST"])
+def approve_qr(token):
+    row = get_login_request(token)
+    if not row:
+        return render_page("Approve QR", """
+        <div class="card"><h2>Approve Login</h2><p class="error">Invalid or missing approval request.</p></div>
+        """)
+
+    username = row["username"]
+    status = row["status"]
+
+    if not current_user():
+        return redirect(url_for("login", next=url_for("approve_qr", token=token)))
+
+    if current_user() != username:
+        return render_page("Approve QR", f"""
+        <div class="card">
+            <h2>Approve Login</h2>
+            <p class="error">You are logged in as <strong>{current_user()}</strong>, but this request belongs to <strong>{username}</strong>.</p>
+            <p>Log into the correct trusted account to approve it. Humans do love making account mix-ups.</p>
+        </div>
+        """)
+
+    if not is_trusted_device(username, current_device_id()):
+        return render_page("Approve QR", """
+        <div class="card">
+            <h2>Approve Login</h2>
+            <p class="error">This device is not trusted for this account, so it cannot approve the login.</p>
+        </div>
+        """)
+
+    login_hour = datetime.now().hour
+    failed_attempts = 0
+    new_device = 1
+    distance_km = random.uniform(1, 4000)
+    trusted_device = 1
+
+    risk_label, proba = predict_risk(
+        login_hour,
+        failed_attempts,
+        new_device,
+        distance_km,
+        trusted_device
+    )
+
+    if request.method == "POST" and status == "pending":
+        action = request.form.get("action")
+
+        if action == "approve":
+            if risk_label == "High Risk":
+                flash("High-risk request. Approval was not allowed automatically.")
+            else:
+                update_login_request_status(token, "approved", risk_label)
+                save_login_log(
+                    username, login_hour, failed_attempts,
+                    new_device, distance_km, trusted_device, risk_label
+                )
+                flash("Login approved. The waiting device can now sign in.")
+                return redirect(url_for("approve_qr", token=token))
+
+        elif action == "block":
+            update_login_request_status(token, "blocked", "Blocked")
+            save_login_log(
+                username, login_hour, failed_attempts,
+                new_device, distance_km, trusted_device, "Blocked"
+            )
+            flash("Login blocked.")
+            return redirect(url_for("approve_qr", token=token))
+
+    status_block = f"""
+    <p><strong>Username:</strong> {username}</p>
+    <p><strong>Status:</strong> {status}</p>
+    <p class="muted"><strong>Created:</strong> {row["created_at"]}</p>
+    """
+
+    risk_block = f"""
+    <div class="card">
+        <h3>Machine Learning Risk Analysis</h3>
+        <p><strong>Login Hour:</strong> {login_hour}</p>
+        <p><strong>Failed Attempts:</strong> {failed_attempts}</p>
+        <p><strong>New Device:</strong> Yes</p>
+        <p><strong>Distance (km):</strong> {distance_km:.2f}</p>
+        <p><strong>Trusted Approver Device:</strong> Yes</p>
+        <p><strong>Prediction:</strong> {risk_label}</p>
+        <p class="muted">
+            Low: {float(proba[0]):.4f} |
+            Medium: {float(proba[1]):.4f} |
+            High: {float(proba[2]):.4f}
+        </p>
+    </div>
+    """
+
+    buttons = ""
+    if status == "pending":
+        if risk_label == "High Risk":
+            buttons = """
+            <p class="warn">High-risk login detected. You can block it below.</p>
+            <form method="post">
+                <button type="submit" name="action" value="block">Block Login</button>
+            </form>
+            """
         else:
-            current_device = get_device_hash()
-            cookie_manager.set("device_name", device_name, key="save_login_device_name")
-
-            if is_trusted_device(username, current_device):
-                st.session_state["user"] = username
-                st.session_state["failed_attempts"] = 0
-                cookie_manager.set("user", username, key="login_user_cookie")
-                add_trusted_device(username, current_device, device_name)
-
-                if st.session_state.get("approve_token"):
-                    st.session_state["page"] = "Approve QR"
-                    st.success("Login successful. Returning to approval page...")
-                    st.rerun()
-                else:
-                    st.success("Login successful on trusted device.")
-            else:
-                request_token = create_login_request(username, current_device)
-                approve_link = f"{APP_URL}/?approve_token={request_token}"
-
-                qr = qrcode.make(approve_link)
-                buf = BytesIO()
-                qr.save(buf, format="PNG")
-
-                st.session_state["pending_request_token"] = request_token
-                st.session_state["pending_request_username"] = username
-                st.session_state["pending_new_device_name"] = device_name
-
-                st.warning("This device is not trusted.")
-                st.info("Scan the QR code with a trusted device to approve the login.")
-                st.image(buf.getvalue(), caption="Scan with a trusted device")
-                st.code(approve_link, language="text")
-
-    if "pending_request_token" in st.session_state:
-        st.markdown("---")
-        st.subheader("Pending Login Request")
-        st.write(f"**Username:** {st.session_state.get('pending_request_username', '')}")
-        st.write(f"**Request Token:** {st.session_state['pending_request_token']}")
-
-        req = get_login_request(st.session_state["pending_request_token"])
-        if req:
-            _, _, _, _, status, created_at = req
-            st.write(f"**Status:** {status}")
-            st.caption(f"Created: {created_at}")
-
-        if st.button("I've been approved, continue login"):
-            req = get_login_request(st.session_state["pending_request_token"])
-
-            if not req:
-                st.error("Login request not found.")
-            else:
-                _, _, username_req, _, status, _ = req
-
-                if status == "approved":
-                    st.session_state["user"] = username_req
-                    st.session_state["failed_attempts"] = 0
-                    cookie_manager.set("user", username_req, key="approved_user_cookie")
-                    cookie_manager.set(
-                        "device_name",
-                        st.session_state.get("pending_new_device_name", default_device_name()),
-                        key="approved_device_name_cookie"
-                    )
-
-                    add_trusted_device(
-                        username_req,
-                        get_device_hash(),
-                        st.session_state.get("pending_new_device_name", default_device_name())
-                    )
-
-                    del st.session_state["pending_request_token"]
-                    del st.session_state["pending_request_username"]
-                    del st.session_state["pending_new_device_name"]
-
-                    st.success("Login successful. This new device is now linked as trusted.")
-                    st.rerun()
-
-                elif status == "blocked":
-                    st.error("This login request was blocked.")
-                else:
-                    st.info("Approval is still pending.")
-
-
-# =========================================================
-# DASHBOARD
-# =========================================================
-elif menu == "Dashboard":
-    st.title("Dashboard")
-
-    if not st.session_state["user"]:
-        st.warning("Please log in first.")
+            buttons = """
+            <form method="post">
+                <button type="submit" name="action" value="approve">Approve Login</button>
+                <button type="submit" name="action" value="block">Block Login</button>
+            </form>
+            """
     else:
-        username = st.session_state["user"]
-        st.success(f"Logged in as: {username}")
+        buttons = f'<p><strong>Final Status:</strong> {status}</p>'
 
-        st.subheader("Trusted Devices")
-        devices = get_user_devices(username)
-
-        if devices:
-            current_hash = get_device_hash()
-            for d_hash, d_name, trusted, created_at in devices:
-                col1, col2 = st.columns([5, 1])
-
-                with col1:
-                    marker = " (Current Device)" if d_hash == current_hash else ""
-                    st.write(f"**{d_name}{marker}**")
-                    st.caption(f"Trusted: {'Yes' if trusted else 'No'} | Added: {created_at}")
-                    st.caption(f"Hash: {d_hash[:24]}...")
-
-                with col2:
-                    if d_hash != current_hash:
-                        if st.button("Unlink", key=f"unlink_{d_hash}"):
-                            remove_device(username, d_hash)
-                            st.success("Device unlinked.")
-                            st.rerun()
-        else:
-            st.info("No devices linked.")
-
-        st.markdown("---")
-        st.subheader("Recent Login Requests")
-        recent_requests = get_recent_login_requests(username)
-        if recent_requests:
-            req_df = pd.DataFrame(recent_requests, columns=["Request Token", "Status", "Created At"])
-            st.dataframe(req_df, use_container_width=True)
-        else:
-            st.info("No login requests found.")
-
-        st.markdown("---")
-        if st.button("Logout"):
-            st.session_state["user"] = None
-            cookie_manager.delete("user", key="delete_user_cookie")
-            st.success("Logged out.")
-            st.rerun()
+    body = f"""
+    <div class="card">
+        <h2>Approve Login Request</h2>
+        {status_block}
+    </div>
+    {risk_block}
+    <div class="card">
+        {buttons}
+    </div>
+    """
+    return render_page("Approve QR", body)
 
 
-# =========================================================
-# APPROVE QR
-# =========================================================
-elif menu == "Approve QR":
-    st.title("Approve Login Request")
+@app.route("/dashboard")
+@login_required
+def dashboard():
+    username = current_user()
+    devices = get_user_devices(username)
+    requests_ = get_recent_login_requests(username)
 
-    token_default = st.session_state.get("approve_token", "")
-    token = st.text_input("Approval Token", value=token_default)
+    device_rows = ""
+    for d in devices:
+        current_tag = " (Current Device)" if d["device_id"] == current_device_id() else ""
+        unlink = ""
+        if d["device_id"] != current_device_id():
+            unlink = f'<a class="button" href="{url_for("unlink_device", device_id=d["device_id"])}">Unlink</a>'
+        device_rows += f"""
+        <tr>
+            <td>{d["device_name"] or "Unnamed Device"}{current_tag}</td>
+            <td>{"Yes" if d["trusted"] else "No"}</td>
+            <td>{d["created_at"]}</td>
+            <td>{unlink}</td>
+        </tr>
+        """
 
-    if not token:
-        st.info("No approval token found.")
-    elif not st.session_state.get("user"):
-        st.warning("Please log in on this trusted device first. You will be returned here after login.")
-    else:
-        req = get_login_request(token)
+    request_rows = ""
+    for r in requests_:
+        request_rows += f"""
+        <tr>
+            <td>{r["request_token"]}</td>
+            <td>{r["status"]}</td>
+            <td>{r["risk_result"] or "-"}</td>
+            <td>{r["created_at"]}</td>
+        </tr>
+        """
 
-        if not req:
-            st.error("Invalid or missing login request.")
-        else:
-            _, request_token, username, requester_device_hash, status, created_at = req
+    body = f"""
+    <div class="card">
+        <h2>Dashboard</h2>
+        <p>Welcome, <strong>{username}</strong>.</p>
+    </div>
 
-            st.write(f"**Username:** {username}")
-            st.write(f"**Status:** {status}")
-            st.caption(f"Created: {created_at}")
+    <div class="card">
+        <h3>Trusted Devices</h3>
+        <table>
+            <tr>
+                <th>Device Name</th>
+                <th>Trusted</th>
+                <th>Added</th>
+                <th>Action</th>
+            </tr>
+            {device_rows if device_rows else '<tr><td colspan="4">No linked devices.</td></tr>'}
+        </table>
+    </div>
 
-            if st.session_state.get("user") != username:
-                st.error("You are logged into a different account. Please log into the correct trusted account to approve this request.")
-            else:
-                current_device = get_device_hash()
-                trusted = is_trusted_device(username, current_device)
+    <div class="card">
+        <h3>Recent Login Requests</h3>
+        <table>
+            <tr>
+                <th>Token</th>
+                <th>Status</th>
+                <th>Risk</th>
+                <th>Created</th>
+            </tr>
+            {request_rows if request_rows else '<tr><td colspan="4">No login requests yet.</td></tr>'}
+        </table>
+    </div>
 
-                if status != "pending":
-                    st.warning(f"This request is already {status}.")
-                elif not trusted:
-                    st.error("This device is not trusted for this account, so it cannot approve the login.")
-                else:
-                    login_hour = datetime.now().hour
-                    failed_attempts = 0
-                    new_device = 1
-                    distance_km = random.uniform(1, 4000)
-                    trusted_device = 1
-
-                    risk_label, proba = predict_risk(
-                        login_hour,
-                        failed_attempts,
-                        new_device,
-                        distance_km,
-                        trusted_device
-                    )
-
-                    st.subheader("Machine Learning Risk Analysis")
-                    st.write(f"**Login Hour:** {login_hour}")
-                    st.write(f"**Failed Attempts:** {failed_attempts}")
-                    st.write(f"**New Device:** Yes")
-                    st.write(f"**Distance (km):** {distance_km:.2f}")
-                    st.write(f"**Trusted Approver Device:** Yes")
-                    st.write(f"### Prediction: {risk_label}")
-
-                    prob_df = pd.DataFrame({
-                        "Risk Level": ["Low Risk", "Medium Risk", "High Risk"],
-                        "Probability": [
-                            round(float(proba[0]), 4),
-                            round(float(proba[1]), 4),
-                            round(float(proba[2]), 4)
-                        ]
-                    })
-                    st.dataframe(prob_df, use_container_width=True)
-
-                    col1, col2 = st.columns(2)
-
-                    with col1:
-                        if risk_label == "High Risk":
-                            st.warning("High-risk login detected. Approval is discouraged.")
-                        else:
-                            if st.button("Approve Login"):
-                                update_login_request_status(token, "approved")
-                                save_login_log(
-                                    username,
-                                    login_hour,
-                                    failed_attempts,
-                                    new_device,
-                                    distance_km,
-                                    trusted_device,
-                                    risk_label
-                                )
-                                st.success("Login approved. The waiting device can now complete login.")
-
-                    with col2:
-                        if st.button("Block Login"):
-                            update_login_request_status(token, "blocked")
-                            save_login_log(
-                                username,
-                                login_hour,
-                                failed_attempts,
-                                new_device,
-                                distance_km,
-                                trusted_device,
-                                "Blocked"
-                            )
-                            st.error("Login blocked.")
+    <div class="card">
+        <p><a class="button" href="{url_for('admin_logs')}">View Authentication Logs</a></p>
+    </div>
+    """
+    return render_page("Dashboard", body)
 
 
-# =========================================================
-# ADMIN LOGS
-# =========================================================
-elif menu == "Admin Logs":
-    st.title("Authentication Logs")
+@app.route("/unlink/<device_id>")
+@login_required
+def unlink_device(device_id):
+    if device_id == current_device_id():
+        flash("You cannot unlink the device you are currently using.")
+        return redirect(url_for("dashboard"))
 
+    remove_device(current_user(), device_id)
+    flash("Device unlinked.")
+    return redirect(url_for("dashboard"))
+
+
+@app.route("/logs")
+@login_required
+def admin_logs():
     rows = get_logs()
-    if rows:
-        df = pd.DataFrame(rows, columns=[
-            "Username",
-            "Login Hour",
-            "Failed Attempts",
-            "New Device",
-            "Distance (km)",
-            "Trusted Device",
-            "Risk Result",
-            "Timestamp"
-        ])
-        st.dataframe(df, use_container_width=True)
-    else:
-        st.info("No logs yet.")
+
+    html_rows = ""
+    for row in rows:
+        html_rows += f"""
+        <tr>
+            <td>{row["username"]}</td>
+            <td>{row["login_hour"]}</td>
+            <td>{row["failed_attempts"]}</td>
+            <td>{row["new_device"]}</td>
+            <td>{row["distance_km"]:.2f}</td>
+            <td>{row["trusted_device"]}</td>
+            <td>{row["risk_result"]}</td>
+            <td>{row["timestamp"]}</td>
+        </tr>
+        """
+
+    body = f"""
+    <div class="card">
+        <h2>Authentication Logs</h2>
+        <table>
+            <tr>
+                <th>User</th>
+                <th>Hour</th>
+                <th>Failed Attempts</th>
+                <th>New Device</th>
+                <th>Distance</th>
+                <th>Trusted Device</th>
+                <th>Risk Result</th>
+                <th>Timestamp</th>
+            </tr>
+            {html_rows if html_rows else '<tr><td colspan="8">No logs yet.</td></tr>'}
+        </table>
+    </div>
+    """
+    return render_page("Logs", body)
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    flash("Logged out.")
+    return redirect(url_for("login"))
+
+
+# =========================================================
+# RUN
+# =========================================================
+if __name__ == "__main__":
+    app.run(debug=True)
