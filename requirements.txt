@@ -1,6 +1,6 @@
-streamlit
+flask
 qrcode
 pillow
-extra-streamlit-components
-streamlit-autorefresh
+pandas
 scikit-learn
+gunicorn
